@@ -16,9 +16,9 @@ export class SuccessResponse extends ApiResponse {
   readonly statusCode: number;
   readonly success = true as const;
   readonly message: string;
-  readonly data: unknown[];
+  readonly data: unknown;
 
-  constructor(data: unknown[] = [], message = 'Success', statusCode = 200) {
+  constructor(data: unknown = [], message = 'Success', statusCode = 200) {
     super();
     this.data = data;
     this.message = message;

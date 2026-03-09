@@ -3,6 +3,7 @@ import { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { BaseRoute } from '../BaseRoute';
 import { SuccessResponse, ErrorResponse } from '../../http/ApiResponse';
 import { TelegramClientService } from '../../telegram/TelegramClientService';
+import { TelegramSessionPool } from '../../telegram/TelegramSessionPool';
 
 interface GetFullUserBody {
   sessionCode: string;
@@ -21,6 +22,18 @@ interface SetSecureValueErrorsBody {
 }
 
 export class UserRoute extends BaseRoute {
+  private async withSession<T>(
+    sessionCode: string,
+    operation: (client: TelegramClientService) => Promise<T>,
+  ): Promise<T> {
+    const { client, fromPool } = await TelegramSessionPool.getInstance().resolve(sessionCode);
+    try {
+      return await operation(client);
+    } finally {
+      if (!fromPool) await client.disconnect();
+    }
+  }
+
   async register(fastify: FastifyInstance): Promise<void> {
     fastify.post('/users/GetFullUser', async (request: FastifyRequest, reply: FastifyReply) => {
       const { sessionCode, id } = request.body as GetFullUserBody;
@@ -29,12 +42,9 @@ export class UserRoute extends BaseRoute {
         return new ErrorResponse('sessionCode and id are required', 400).send(reply);
       }
 
-      const telegram = TelegramClientService.initialize(sessionCode);
-      await telegram.connect();
-
       try {
-        const result = await telegram.getClient().invoke(
-          new Api.users.GetFullUser({ id }),
+        const result = await this.withSession(sessionCode, (client) =>
+          client.getClient().invoke(new Api.users.GetFullUser({ id })),
         );
 
         new SuccessResponse([result], 'User fetched successfully').send(reply);
@@ -50,12 +60,9 @@ export class UserRoute extends BaseRoute {
         return new ErrorResponse('sessionCode and id are required', 400).send(reply);
       }
 
-      const telegram = TelegramClientService.initialize(sessionCode);
-      await telegram.connect();
-
       try {
-        const result = await telegram.getClient().invoke(
-          new Api.users.GetUsers({ id }),
+        const result = await this.withSession(sessionCode, (client) =>
+          client.getClient().invoke(new Api.users.GetUsers({ id })),
         );
 
         new SuccessResponse(result, 'Users fetched successfully').send(reply);
@@ -71,12 +78,9 @@ export class UserRoute extends BaseRoute {
         return new ErrorResponse('sessionCode, id and errors are required', 400).send(reply);
       }
 
-      const telegram = TelegramClientService.initialize(sessionCode);
-      await telegram.connect();
-
       try {
-        const result = await telegram.getClient().invoke(
-          new Api.users.SetSecureValueErrors({ id, errors }),
+        const result = await this.withSession(sessionCode, (client) =>
+          client.getClient().invoke(new Api.users.SetSecureValueErrors({ id, errors })),
         );
 
         new SuccessResponse([{ success: result }], 'Secure value errors set successfully').send(reply);

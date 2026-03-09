@@ -3,6 +3,7 @@ import { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { BaseRoute } from '../BaseRoute';
 import { SuccessResponse, ErrorResponse } from '../../http/ApiResponse';
 import { TelegramClientService } from '../../telegram/TelegramClientService';
+import { TelegramSessionPool } from '../../telegram/TelegramSessionPool';
 import { DatabaseClient } from '../../database/DatabaseClient';
 
 interface SendCodeBody {
@@ -22,6 +23,11 @@ interface SignInBody {
   sessionCode: string;
 }
 
+
+/**
+ * Force telegram session to disconnect after each request to avoid memory leaks
+ * Only successfully signed in accounts are added to the pool
+ */
 export class AuthRoute extends BaseRoute {
   async register(fastify: FastifyInstance): Promise<void> {
     fastify.post('/auth/SendCode', async (request: FastifyRequest, reply: FastifyReply) => {
@@ -38,7 +44,7 @@ export class AuthRoute extends BaseRoute {
         const result = await telegram.getClient().invoke(
           new Api.auth.SendCode({
             phoneNumber,
-            apiId: process.env.TELEGRAM_API_ID ?? '',
+            apiId: parseInt(process.env.TELEGRAM_API_ID ?? '', 10),
             apiHash: process.env.TELEGRAM_API_HASH ?? '',
             settings: new Api.CodeSettings({}),
           }),
@@ -51,6 +57,8 @@ export class AuthRoute extends BaseRoute {
 
       } catch (error: unknown) {
         ErrorResponse.fromError(error).send(reply);
+      } finally {
+        await telegram.disconnect();
       }
     });
 
@@ -73,9 +81,11 @@ export class AuthRoute extends BaseRoute {
           }),
         );
 
-      new SuccessResponse([result], 'Verification code resent').send(reply);
+        new SuccessResponse([result], 'Verification code resent').send(reply);
       } catch (error: unknown) {
         ErrorResponse.fromError(error).send(reply);
+      } finally {
+        await telegram.disconnect();
       }
     });
 
@@ -98,20 +108,26 @@ export class AuthRoute extends BaseRoute {
             phoneCodeHash: phoneCodeHash,
           }),
         );
-        
+
+        const sessionId = telegram.getSession();
+
         const db = DatabaseClient.getInstance();
         await db.execute((prisma) =>
           prisma.telegramSession.create({
             data: {
-              session_id: telegram.getSession(),
+              session_id: sessionId,
               server_name: process.env.SERVER_NAME ?? 'default',
               status: 'active',
             },
           }),
         );
 
-        new SuccessResponse([result], 'Signed in successfully').send(reply);
+        // Add the session to the pool
+        TelegramSessionPool.getInstance().add(sessionId, telegram);
+
+        new SuccessResponse([{ ...result, sessionId }], 'Signed in successfully').send(reply);
       } catch (error: unknown) {
+        await telegram.disconnect();
         ErrorResponse.fromError(error).send(reply);
       }
     });
