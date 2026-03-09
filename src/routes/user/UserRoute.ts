@@ -21,6 +21,11 @@ interface SetSecureValueErrorsBody {
   errors: Api.TypeSecureValueError[];
 }
 
+/**
+ * All routes are required a valid session code.
+ * The session code is used to identify the user and to perform the operation.
+ * Use TelegramSessionPool.getInstance().resolve(sessionCode); to get the client from the pool.
+ */
 export class UserRoute extends BaseRoute {
   private async withSession<T>(
     sessionCode: string,
