@@ -6,22 +6,6 @@ import { TelegramClientService } from "../../telegram/TelegramClientService";
 import { TelegramSessionPool } from "../../telegram/TelegramSessionPool";
 import { TelegramUtils } from "../../telegram/TelegramUtils";
 
-interface GetFullUserBody {
-	sessionCode: string;
-	id: string;
-}
-
-interface GetUsersBody {
-	sessionCode: string;
-	id: string[];
-}
-
-interface SetSecureValueErrorsBody {
-	sessionCode: string;
-	id: string;
-	errors: Api.TypeSecureValueError[];
-}
-
 /**
  * All routes are required a valid session code.
  * The session code is used to identify the user and to perform the operation.
@@ -58,7 +42,10 @@ export class UserRoute extends BaseRoute {
 		fastify.post(
 			"/users/GetFullUser",
 			async (request: FastifyRequest, reply: FastifyReply) => {
-				const { sessionCode, id } = request.body as GetFullUserBody;
+				const { sessionCode, id } = request.body as {
+					sessionCode: string;
+					id: string;
+				};
 
 				if (!sessionCode || !id) {
 					return new ErrorResponse("sessionCode and id are required", 400).send(
@@ -83,7 +70,10 @@ export class UserRoute extends BaseRoute {
 		fastify.post(
 			"/users/GetUsers",
 			async (request: FastifyRequest, reply: FastifyReply) => {
-				const { sessionCode, id } = request.body as GetUsersBody;
+				const { sessionCode, id } = request.body as {
+					sessionCode: string;
+					id: string[];
+				};
 
 				if (!sessionCode || !id?.length) {
 					return new ErrorResponse("sessionCode and id are required", 400).send(
@@ -106,8 +96,11 @@ export class UserRoute extends BaseRoute {
 		fastify.post(
 			"/users/SetSecureValueErrors",
 			async (request: FastifyRequest, reply: FastifyReply) => {
-				const { sessionCode, id, errors } =
-					request.body as SetSecureValueErrorsBody;
+				const { sessionCode, id, errors } = request.body as {
+					sessionCode: string;
+					id: string;
+					errors: Api.TypeSecureValueError[];
+				};
 
 				if (!sessionCode || !id || !errors?.length) {
 					return new ErrorResponse(

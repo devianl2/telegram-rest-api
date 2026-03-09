@@ -7,23 +7,6 @@ import { TelegramSessionPool } from "../../telegram/TelegramSessionPool";
 import { DatabaseClient } from "../../database/DatabaseClient";
 import { SessionStatus } from "../../database/constants/SessionStatus";
 
-interface SendCodeBody {
-	phoneNumber: string;
-}
-
-interface ResendCodeBody {
-	phoneNumber: string;
-	phoneCodeHash: string;
-	sessionCode: string;
-}
-
-interface SignInBody {
-	phoneNumber: string;
-	phoneCode: string;
-	phoneCodeHash: string;
-	sessionCode: string;
-}
-
 /**
  * Force telegram session to disconnect after each request to avoid memory leaks
  * Only successfully signed in accounts are added to the pool
@@ -33,7 +16,7 @@ export class AuthRoute extends BaseRoute {
 		fastify.post(
 			"/auth/SendCode",
 			async (request: FastifyRequest, reply: FastifyReply) => {
-				const { phoneNumber } = request.body as SendCodeBody;
+				const { phoneNumber } = request.body as { phoneNumber: string };
 
 				if (!phoneNumber) {
 					return new ErrorResponse("phoneNumber is required", 400).send(reply);
@@ -72,8 +55,11 @@ export class AuthRoute extends BaseRoute {
 		fastify.post(
 			"/auth/ResendCode",
 			async (request: FastifyRequest, reply: FastifyReply) => {
-				const { phoneNumber, phoneCodeHash, sessionCode } =
-					request.body as ResendCodeBody;
+				const { phoneNumber, phoneCodeHash, sessionCode } = request.body as {
+					phoneNumber: string;
+					phoneCodeHash: string;
+					sessionCode: string;
+				};
 
 				if (!phoneNumber) {
 					return new ErrorResponse("phoneNumber is required", 400).send(reply);
@@ -104,7 +90,12 @@ export class AuthRoute extends BaseRoute {
 			"/auth/SignIn",
 			async (request: FastifyRequest, reply: FastifyReply) => {
 				const { phoneNumber, phoneCodeHash, phoneCode, sessionCode } =
-					request.body as SignInBody;
+					request.body as {
+						phoneNumber: string;
+						phoneCodeHash: string;
+						phoneCode: string;
+						sessionCode: string;
+					};
 
 				if (!phoneNumber || !phoneCodeHash || !phoneCode || !sessionCode) {
 					return new ErrorResponse(
