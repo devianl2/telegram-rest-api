@@ -1,31 +1,43 @@
 # Do not use alpine base image for gramjs: https://github.com/gram-js/gramjs/issues/637
 # Alpine uses musl libc which breaks GramJS's MTProto Diffie-Hellman key exchange
-# ─── Stage 1: Builder ────────────────────────────────────────────────────────
-FROM node:22-slim AS builder
+
+# ─── Development ─────────────────────────────────────────────────────────────
+FROM node:22-slim AS development
+
+RUN apt-get update -y && apt-get install -y openssl && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
 COPY package*.json ./
+COPY prisma ./prisma
 
 RUN npm install
 
 COPY tsconfig.json ./
 COPY src ./src
 
-RUN npm run build
+EXPOSE 3000
 
-# ─── Stage 2: Production ─────────────────────────────────────────────────────
+CMD ["npm", "run", "dev"]
+
+# ─── Production ───────────────────────────────────────────────────────────────
 FROM node:22-slim AS production
+
+RUN apt-get update -y && apt-get install -y openssl && rm -rf /var/lib/apt/lists/*
 
 ENV NODE_ENV=production
 
 WORKDIR /app
 
 COPY package*.json ./
+COPY prisma ./prisma
 
-RUN npm install --omit=dev && npm cache clean --force
+RUN npm install
 
-COPY --from=builder /app/dist ./dist
+COPY tsconfig.json ./
+COPY src ./src
+
+RUN npm run build && npm prune --omit=dev && npm cache clean --force
 
 EXPOSE 3000
 

@@ -1,0 +1,15 @@
+.env
+.env.*
+!.env.example
+node_modules/
+dist/
+.git/
+.gitignore
+.cursor/
+.vscode/
+.idea/
+.trae/
+*.log
+docker/
+docker-compose.yml
+README.md

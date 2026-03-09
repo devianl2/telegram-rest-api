@@ -3,6 +3,7 @@ import { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { BaseRoute } from '../BaseRoute';
 import { SuccessResponse, ErrorResponse } from '../../http/ApiResponse';
 import { TelegramClientService } from '../../telegram/TelegramClientService';
+import { DatabaseClient } from '../../database/DatabaseClient';
 
 interface SendCodeBody {
   phoneNumber: string;
@@ -23,7 +24,7 @@ interface SignInBody {
 
 export class AuthRoute extends BaseRoute {
   async register(fastify: FastifyInstance): Promise<void> {
-    fastify.post('/auth/send-code', async (request: FastifyRequest, reply: FastifyReply) => {
+    fastify.post('/auth/SendCode', async (request: FastifyRequest, reply: FastifyReply) => {
       const { phoneNumber } = request.body as SendCodeBody;
 
       if (!phoneNumber) {
@@ -44,17 +45,16 @@ export class AuthRoute extends BaseRoute {
         );
   
         new SuccessResponse(
-          [{ phoneCodeHash: result.phoneCodeHash, session: telegram.getSessionString() }],
+          [{ phoneCodeHash: result.phoneCodeHash, session: telegram.getSession() }],
           'Verification code sent',
         ).send(reply);
 
       } catch (error: unknown) {
-        const message = error instanceof Error ? error.message : 'Unknown error';
-        new ErrorResponse(message, 400).send(reply);
+        ErrorResponse.fromError(error).send(reply);
       }
     });
 
-    fastify.post('/auth/resend-code', async (request: FastifyRequest, reply: FastifyReply) => {
+    fastify.post('/auth/ResendCode', async (request: FastifyRequest, reply: FastifyReply) => {
       const { phoneNumber, phoneCodeHash, sessionCode } = request.body as ResendCodeBody;
     
       if (!phoneNumber) {
@@ -75,13 +75,11 @@ export class AuthRoute extends BaseRoute {
 
       new SuccessResponse([result], 'Verification code resent').send(reply);
       } catch (error: unknown) {
-        const message = error instanceof Error ? error.message : 'Unknown error';
-        
-        new ErrorResponse(message, 400).send(reply);
+        ErrorResponse.fromError(error).send(reply);
       }
     });
 
-    fastify.post('/auth/sign-in', async (request: FastifyRequest, reply: FastifyReply) => {
+    fastify.post('/auth/SignIn', async (request: FastifyRequest, reply: FastifyReply) => {
       const { phoneNumber, phoneCodeHash, phoneCode, sessionCode } = request.body as SignInBody;
     
       if (!phoneNumber || !phoneCodeHash || !phoneCode || !sessionCode) {
@@ -100,11 +98,21 @@ export class AuthRoute extends BaseRoute {
             phoneCodeHash: phoneCodeHash,
           }),
         );
-    
+        
+        const db = DatabaseClient.getInstance();
+        await db.execute((prisma) =>
+          prisma.telegramSession.create({
+            data: {
+              session_id: telegram.getSession(),
+              server_name: process.env.SERVER_NAME ?? 'default',
+              status: 'active',
+            },
+          }),
+        );
+
         new SuccessResponse([result], 'Signed in successfully').send(reply);
       } catch (error: unknown) {
-        const message = error instanceof Error ? error.message : 'Unknown error';
-        new ErrorResponse(message, 400).send(reply);
+        ErrorResponse.fromError(error).send(reply);
       }
     });
   }

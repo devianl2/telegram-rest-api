@@ -6,15 +6,22 @@
   "scripts": {
     "build": "tsc",
     "start": "node dist/server.js",
-    "dev": "ts-node-dev --respawn --transpile-only src/server.ts"
+    "dev": "ts-node-dev --respawn --transpile-only src/server.ts",
+    "postinstall": "prisma generate"
   },
   "dependencies": {
+    "@prisma/adapter-mariadb": "^6.5.0",
+    "@prisma/adapter-pg": "^6.5.0",
+    "@prisma/client": "^6.5.0",
     "dotenv": "^16.4.7",
     "fastify": "^5.2.1",
+    "pg": "^8.13.0",
     "telegram": "^2.23.0"
   },
   "devDependencies": {
     "@types/node": "^22.13.9",
+    "@types/pg": "^8.11.0",
+    "prisma": "^6.5.0",
     "ts-node-dev": "^2.0.0",
     "typescript": "^5.8.2"
   }

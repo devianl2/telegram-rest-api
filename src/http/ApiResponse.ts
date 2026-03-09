@@ -45,6 +45,14 @@ export class ErrorResponse extends ApiResponse {
     this.statusCode = statusCode;
   }
 
+  static fromError(error: unknown, fallbackCode = 400): ErrorResponse {
+    const message = error instanceof Error ? error.message : 'Unknown error';
+    const code = (error instanceof Error && 'code' in error && typeof (error as Error & { code: unknown }).code === 'number')
+      ? (error as Error & { code: number }).code
+      : fallbackCode;
+    return new ErrorResponse(message, code);
+  }
+
   toJSON(): ApiResponseBody {
     return {
       success: this.success,

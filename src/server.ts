@@ -2,6 +2,7 @@ import 'dotenv/config';
 import { Application } from './app';
 import { ApiKeyMiddleware } from './middleware/ApiKeyMiddleware';
 import { AuthRoute } from './routes/auth/AuthRoute';
+import { UserRoute } from './routes/user/UserRoute';
 
 const APPLICATION_API_KEY = process.env.APPLICATION_API_KEY ?? '';
 const PORT = parseInt(process.env.PORT ?? '3000', 10);
@@ -11,6 +12,7 @@ app
   .registerMiddleware(new ApiKeyMiddleware(APPLICATION_API_KEY))
   .registerRoutes([
     new AuthRoute(),
+    new UserRoute(),
   ]);
 
 app.start(PORT).catch((err: unknown) => {

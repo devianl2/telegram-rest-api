@@ -2,12 +2,28 @@ services:
   api:
     build:
       context: .
-      dockerfile: docker/Dockerfile.dev
+      dockerfile: docker/Dockerfile
+      target: production
     ports:
       - "3000:3000"
     env_file:
       - .env
+    profiles:
+      - production
+    
+  # Development
+  # docker compose --profile development up api-dev --build -d
+  api-dev:
+    extends:
+      service: api
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      target: development
     volumes:
       - .:/app
       - /app/node_modules
+    profiles:
+      - development
+    network_mode: "bridge" # use the default bridge network to connect to the db service (For development purposes)
     command: sh -c "npm install && npm run dev"

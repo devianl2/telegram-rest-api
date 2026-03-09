@@ -41,7 +41,7 @@ export class TelegramClientService implements TelegramClientInterface {
     return this.client;
   }
 
-  getSessionString(): string {
+  getSession(): string {
     return (this.client.session as StringSession).save();
   }
 }
