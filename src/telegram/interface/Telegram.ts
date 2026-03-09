@@ -1,8 +1,8 @@
-import { TelegramClient } from 'telegram';
+import { TelegramClient } from "telegram";
 
 export interface TelegramClientInterface {
-  connect(): Promise<void>;
-  disconnect(): Promise<void>;
-  getClient(): TelegramClient;
-  getSession(): string;
+	connect(): Promise<void>;
+	disconnect(): Promise<void>;
+	getClient(): TelegramClient;
+	getSession(): string;
 }
