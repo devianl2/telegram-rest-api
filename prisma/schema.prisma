@@ -14,13 +14,29 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
+model Tenant {
+  id               Int               @id @default(autoincrement())
+  secret_id        String            @unique @db.VarChar(20)
+  secret_code      String            @unique @db.VarChar(50)
+  callback_url     String            @db.Text
+  created_at       DateTime          @default(now())
+  updated_at       DateTime          @updatedAt
+  telegramSessions TelegramSession[]
+
+  @@map("tenants")
+}
+
 model TelegramSession {
   id          Int      @id @default(autoincrement())
+  tenant_id   Int
   session_id  String   @db.Text
-  server_name String   @db.VarChar(255)
+  telegram_user_id  String   @db.VarChar(255)
+  telegram_username String   @db.VarChar(255)
+  telegram_access_hash  String  @db.VarChar(255)
   status      String   @db.VarChar(50)
   created_at  DateTime @default(now())
   updated_at  DateTime @updatedAt
+  tenant      Tenant   @relation(fields: [tenant_id], references: [id])
 
   @@map("telegram_sessions")
 }

@@ -5,7 +5,6 @@ import { AuthRoute } from "./routes/auth/AuthRoute";
 import { UserRoute } from "./routes/user/UserRoute";
 import { TelegramSessionPool } from "./telegram/TelegramSessionPool";
 
-const APPLICATION_API_KEY = process.env.APPLICATION_API_KEY ?? "";
 const PORT = parseInt(process.env.PORT ?? "3000", 10);
 
 async function bootstrap(): Promise<void> {
@@ -13,7 +12,7 @@ async function bootstrap(): Promise<void> {
 
 	const app = new Application();
 	app
-		.registerMiddleware(new ApiKeyMiddleware(APPLICATION_API_KEY))
+		.registerMiddleware(new ApiKeyMiddleware())
 		.registerRoutes([new AuthRoute(), new UserRoute()]);
 
 	await app.start(PORT);

@@ -140,14 +140,19 @@ export class AuthRoute extends BaseRoute {
 						}),
 					);
 
-					const sessionId = telegram.getSession();
+					console.log(result);
 
+					const tenant = await this.getTenant(request);
+					const sessionId = telegram.getSession();
 					const db = DatabaseClient.getInstance();
 					await db.execute((prisma) =>
 						prisma.telegramSession.create({
 							data: {
+								tenant_id: tenant.id,
 								session_id: sessionId,
-								server_name: process.env.SERVER_NAME ?? "default",
+								telegram_user_id: result.user.id.toString(),
+								telegram_username: result.user.username ?? "",
+								telegram_access_hash: result.user.accessHash.toString() ?? "",
 								status: SessionStatus.ACTIVE,
 							},
 						}),

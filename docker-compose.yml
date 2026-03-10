@@ -10,7 +10,7 @@ services:
       - .env
     profiles:
       - production
-    
+
   # Development
   # docker compose --profile development up api-dev --build -d
   api-dev:

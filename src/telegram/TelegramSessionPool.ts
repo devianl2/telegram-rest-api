@@ -4,8 +4,10 @@ import { SessionStatus } from "../database/constants/SessionStatus";
 
 interface TelegramSessionRecord {
 	id: number;
+	tenant_id: number;
 	session_id: string;
-	server_name: string;
+	telegram_user_id: string;
+	telegram_username: string;
 	status: string;
 }
 
