@@ -140,8 +140,6 @@ export class AuthRoute extends BaseRoute {
 						}),
 					);
 
-					console.log(result);
-
 					const tenant = await this.getTenant(request);
 					const sessionId = telegram.getSession();
 					const db = DatabaseClient.getInstance();
