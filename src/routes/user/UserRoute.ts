@@ -34,7 +34,7 @@ export class UserRoute extends BaseRoute {
 			}
 			throw error;
 		} finally {
-			if (!fromPool) await client.disconnect();
+			if (!fromPool) await client.destroy();
 		}
 	}
 

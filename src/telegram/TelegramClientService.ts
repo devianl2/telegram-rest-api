@@ -15,10 +15,8 @@ export class TelegramClientService implements TelegramClientInterface {
 			this.apiId,
 			this.apiHash,
 			{
-				connectionRetries: 5,
-				retryDelay: 1000,
-				timeout: 30,
-				useWSS: false,
+				connectionRetries: 2,
+				retryDelay: 5000,
 			},
 		);
 	}
@@ -40,8 +38,8 @@ export class TelegramClientService implements TelegramClientInterface {
 		await this.client.connect();
 	}
 
-	async disconnect(): Promise<void> {
-		await this.client.disconnect();
+	async destroy(): Promise<void> {
+		await this.client.destroy();
 	}
 
 	getClient(): TelegramClient {

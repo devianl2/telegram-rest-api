@@ -29,22 +29,35 @@ export class TelegramSessionPool {
 		return TelegramSessionPool.instance;
 	}
 
-	async add(sessionId: string, client: TelegramClientService, telegramUserId?: string): Promise<void> {
+	add(
+		sessionId: string,
+		client: TelegramClientService,
+		telegramUserId?: string,
+	): void {
 		this.pool.set(sessionId, client);
 
 		if (telegramUserId) {
-			await this.startMessageHandler(sessionId, client, telegramUserId);
+			this.startMessageHandler(sessionId, client, telegramUserId);
 		}
 	}
 
-	private async startMessageHandler(
+	private startMessageHandler(
 		sessionId: string,
 		client: TelegramClientService,
 		telegramUserId: string,
-	): Promise<void> {
-		const handler = new IncomingMessageHandler(client.getClient(), telegramUserId);
-		await handler.start();
+	): void {
+		const handler = new IncomingMessageHandler(
+			client.getClient(),
+			telegramUserId,
+		);
 		this.messageHandlers.set(sessionId, handler);
+
+		handler.start().catch((error) => {
+			console.error(
+				`Failed to start message handler for user ${telegramUserId}:`,
+				error,
+			);
+		});
 	}
 
 	get(sessionId: string): TelegramClientService | undefined {
@@ -59,7 +72,7 @@ export class TelegramSessionPool {
 		this.stopMessageHandler(sessionId);
 		const client = this.pool.get(sessionId);
 		if (client) {
-			await client.disconnect();
+			await client.destroy();
 			this.pool.delete(sessionId);
 		}
 	}
@@ -109,7 +122,7 @@ export class TelegramSessionPool {
 				try {
 					const client = TelegramClientService.initialize(session.session_id);
 					await client.connect();
-					await this.add(session.session_id, client, session.telegram_user_id);
+					this.add(session.session_id, client, session.telegram_user_id);
 				} catch (error) {
 					console.error(`Failed to restore session id=${session.id}:`, error);
 				}
@@ -123,12 +136,12 @@ export class TelegramSessionPool {
 		}
 	}
 
-	// Disconnects the client, removes from pool, and deletes the session from the database.
+	// Destroy the client, removes from pool, and deletes the session from the database.
 	async invalidate(sessionId: string): Promise<void> {
 		this.stopMessageHandler(sessionId);
 		const client = this.pool.get(sessionId);
 		if (client) {
-			await client.disconnect();
+			await client.destroy();
 			this.pool.delete(sessionId);
 		}
 

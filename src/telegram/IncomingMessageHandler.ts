@@ -113,6 +113,8 @@ export class IncomingMessageHandler {
 		return { type: media.className ?? "unknown" };
 	}
 
+	private static readonly INIT_DELAY_MS = 5000;
+
 	async start(): Promise<void> {
 		this.handler = async (event: NewMessageEvent) => {
 			try {
@@ -146,11 +148,13 @@ export class IncomingMessageHandler {
 			}
 		};
 
-		// Register handler BEFORE catch-up so no messages are missed
 		this.client.addEventHandler(this.handler, new NewMessage({ incoming: true }));
 
-		// GramJS needs an initial getDialogs() call to populate the update state (pts/date).
-		// Without this, the update loop has no baseline and events never fire.
+		// Delay the getDialogs() call to let the session stabilize after sign-in.
+		// GramJS's internal update loop needs time before it can fetch updates
+		// without timing out on a freshly authenticated session.
+		await this.delay(IncomingMessageHandler.INIT_DELAY_MS);
+
 		try {
 			await this.client.getDialogs({ limit: 1 });
 		} catch {
@@ -158,6 +162,10 @@ export class IncomingMessageHandler {
 		}
 
 		console.log(`Message handler started for user ${this.telegramUserId}`);
+	}
+
+	private delay(ms: number): Promise<void> {
+		return new Promise((resolve) => setTimeout(resolve, ms));
 	}
 
 	stop(): void {

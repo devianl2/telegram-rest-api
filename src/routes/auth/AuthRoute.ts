@@ -9,7 +9,7 @@ import { DatabaseClient } from "../../database/DatabaseClient";
 import { SessionStatus } from "../../database/constants/SessionStatus";
 
 /**
- * Force telegram session to disconnect after each request to avoid memory leaks
+ * Force telegram session to destroy after each request to avoid memory leaks
  * Only successfully signed in accounts are added to the pool
  */
 export class AuthRoute extends BaseRoute {
@@ -55,7 +55,7 @@ export class AuthRoute extends BaseRoute {
 				} catch (error: unknown) {
 					ErrorResponse.fromError(error).send(reply);
 				} finally {
-					await telegram.disconnect();
+					await telegram.destroy();
 				}
 			},
 		);
@@ -97,7 +97,7 @@ export class AuthRoute extends BaseRoute {
 				} catch (error: unknown) {
 					ErrorResponse.fromError(error).send(reply);
 				} finally {
-					await telegram.disconnect();
+					await telegram.destroy();
 				}
 			},
 		);
@@ -142,13 +142,15 @@ export class AuthRoute extends BaseRoute {
 
 					const tenant = await this.getTenant(request);
 					const sessionId = telegram.getSession();
+					const telegramUserId = result.user.id.toString();
+
 					const db = DatabaseClient.getInstance();
 					await db.execute((prisma) =>
 						prisma.telegramSession.create({
 							data: {
 								tenant_id: tenant.id,
 								session_id: sessionId,
-								telegram_user_id: result.user.id.toString(),
+								telegram_user_id: telegramUserId,
 								telegram_username: result.user.username ?? "",
 								telegram_access_hash: result.user.accessHash.toString() ?? "",
 								status: SessionStatus.ACTIVE,
@@ -156,11 +158,16 @@ export class AuthRoute extends BaseRoute {
 						}),
 					);
 
-					// Add the session to the pool and start listening for messages
-					await TelegramSessionPool.getInstance().add(
+					// Kill the auth client — its internal state is tainted from the SignIn handshake.
+					await telegram.destroy();
+
+					// A fresh client with the saved session string mirrors what restoreFromDatabase does.
+					const freshClient = TelegramClientService.initialize(sessionId);
+					await freshClient.connect();
+					TelegramSessionPool.getInstance().add(
 						sessionId,
-						telegram,
-						result.user.id.toString(),
+						freshClient,
+						telegramUserId,
 					);
 
 					new SuccessResponse(
@@ -168,7 +175,7 @@ export class AuthRoute extends BaseRoute {
 						"Signed in successfully",
 					).send(reply);
 				} catch (error: unknown) {
-					await telegram.disconnect();
+					await telegram.destroy();
 					ErrorResponse.fromError(error).send(reply);
 				}
 			},
@@ -213,27 +220,43 @@ export class AuthRoute extends BaseRoute {
 						}),
 					);
 
+					const tenant = await this.getTenant(request);
 					const sessionId = telegram.getSession();
+					const telegramUserId = result.user.id.toString();
 
 					const db = DatabaseClient.getInstance();
 					await db.execute((prisma) =>
 						prisma.telegramSession.create({
 							data: {
+								tenant_id: tenant.id,
 								session_id: sessionId,
-								server_name: process.env.SERVER_NAME ?? "default",
+								telegram_user_id: telegramUserId,
+								telegram_username: result.user.username ?? "",
+								telegram_access_hash: result.user.accessHash.toString() ?? "",
 								status: SessionStatus.ACTIVE,
 							},
 						}),
 					);
 
-					await TelegramSessionPool.getInstance().add(sessionId, telegram);
+					// Kill the auth client — its internal state is tainted from the SignUp handshake.
+					await telegram.destroy();
+
+					// A fresh client with the saved session string
+					const freshClient = TelegramClientService.initialize(sessionId);
+					await freshClient.connect();
+
+					TelegramSessionPool.getInstance().add(
+						sessionId,
+						freshClient,
+						telegramUserId,
+					);
 
 					new SuccessResponse(
 						[{ result, sessionId }],
 						"Signed up successfully",
 					).send(reply);
 				} catch (error: unknown) {
-					await telegram.disconnect();
+					await telegram.destroy();
 					ErrorResponse.fromError(error).send(reply);
 				}
 			},
@@ -279,7 +302,7 @@ export class AuthRoute extends BaseRoute {
 				} catch (error: unknown) {
 					ErrorResponse.fromError(error).send(reply);
 				} finally {
-					await telegram.disconnect();
+					await telegram.destroy();
 				}
 			},
 		);
@@ -317,7 +340,9 @@ export class AuthRoute extends BaseRoute {
 					}
 					ErrorResponse.fromError(error).send(reply);
 				} finally {
-					if (!fromPool) await client.disconnect();
+					if (!fromPool) {
+						await client.destroy();
+					}
 				}
 			},
 		);
@@ -355,7 +380,9 @@ export class AuthRoute extends BaseRoute {
 					}
 					ErrorResponse.fromError(error).send(reply);
 				} finally {
-					if (!fromPool) await client.disconnect();
+					if (!fromPool) {
+						await client.destroy();
+					}
 				}
 			},
 		);
