@@ -1,7 +1,6 @@
 import { FastifyReply, FastifyRequest } from "fastify";
 import { ErrorResponse } from "../http/ApiResponse";
-import { DatabaseClient } from "../database/DatabaseClient";
-import { TenantCache, CachedTenant } from "../redis/TenantCache";
+import { TenantService } from "../services/TenantService";
 
 export abstract class BaseMiddleware {
 	abstract handle(request: FastifyRequest, reply: FastifyReply): Promise<void>;
@@ -27,38 +26,14 @@ export class ApiKeyMiddleware extends BaseMiddleware {
 			).send(reply);
 		}
 
-		// If the tenant is cached, return it
-		const cached = await TenantCache.get(secretId, secretCode);
-		if (cached) return;
-
-		const db = DatabaseClient.getInstance();
-		let tenant: CachedTenant | null = null;
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any
 		try {
-			// eslint-disable-next-line @typescript-eslint/no-explicit-any
-			tenant = await db.execute(
-				(prisma) =>
-					(prisma as any).tenant.findFirst({
-						where: { secret_id: secretId, secret_code: secretCode },
-					}) as Promise<CachedTenant | null>,
-			);
-		} catch (dbError) {
-			const errorMessage =
-				dbError instanceof Error ? dbError.message : "Unknown database error";
-			return new ErrorResponse("Database error: " + errorMessage, 500).send(
-				reply,
-			);
+			const tenant = await TenantService.getTenant(secretId, secretCode);
+			if (!tenant) {
+				return new ErrorResponse("Unauthorized", 401).send(reply);
+			}
+		} catch (error) {
+			console.error("Failed to resolve tenant:", (error as Error).message);
+			return new ErrorResponse("Internal Server Error", 500).send(reply);
 		}
-
-		if (!tenant) {
-			return new ErrorResponse("Unauthorized", 401).send(reply);
-		}
-
-		await TenantCache.set(secretId, secretCode, {
-			id: tenant.id,
-			secret_id: tenant.secret_id,
-			secret_code: tenant.secret_code,
-			callback_url: tenant.callback_url,
-		});
 	};
 }
