@@ -156,8 +156,12 @@ export class AuthRoute extends BaseRoute {
 						}),
 					);
 
-					// Add the session to the pool
-					TelegramSessionPool.getInstance().add(sessionId, telegram);
+					// Add the session to the pool and start listening for messages
+					await TelegramSessionPool.getInstance().add(
+						sessionId,
+						telegram,
+						result.user.id.toString(),
+					);
 
 					new SuccessResponse(
 						[{ result, sessionId }],
@@ -222,7 +226,7 @@ export class AuthRoute extends BaseRoute {
 						}),
 					);
 
-					TelegramSessionPool.getInstance().add(sessionId, telegram);
+					await TelegramSessionPool.getInstance().add(sessionId, telegram);
 
 					new SuccessResponse(
 						[{ result, sessionId }],

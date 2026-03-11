@@ -14,7 +14,12 @@ export class TelegramClientService implements TelegramClientInterface {
 			new StringSession(this.session),
 			this.apiId,
 			this.apiHash,
-			{ connectionRetries: 5 },
+			{
+				connectionRetries: 5,
+				retryDelay: 1000,
+				timeout: 30,
+				useWSS: false,
+			},
 		);
 	}
 

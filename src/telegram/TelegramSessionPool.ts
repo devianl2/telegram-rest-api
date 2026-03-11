@@ -1,4 +1,5 @@
 import { TelegramClientService } from "./TelegramClientService";
+import { IncomingMessageHandler } from "./IncomingMessageHandler";
 import { DatabaseClient } from "../database/DatabaseClient";
 import { SessionStatus } from "../database/constants/SessionStatus";
 
@@ -17,6 +18,7 @@ interface TelegramSessionRecord {
 export class TelegramSessionPool {
 	private static instance: TelegramSessionPool;
 	private readonly pool = new Map<string, TelegramClientService>();
+	private readonly messageHandlers = new Map<string, IncomingMessageHandler>();
 
 	private constructor() {}
 
@@ -27,8 +29,22 @@ export class TelegramSessionPool {
 		return TelegramSessionPool.instance;
 	}
 
-	add(sessionId: string, client: TelegramClientService): void {
+	async add(sessionId: string, client: TelegramClientService, telegramUserId?: string): Promise<void> {
 		this.pool.set(sessionId, client);
+
+		if (telegramUserId) {
+			await this.startMessageHandler(sessionId, client, telegramUserId);
+		}
+	}
+
+	private async startMessageHandler(
+		sessionId: string,
+		client: TelegramClientService,
+		telegramUserId: string,
+	): Promise<void> {
+		const handler = new IncomingMessageHandler(client.getClient(), telegramUserId);
+		await handler.start();
+		this.messageHandlers.set(sessionId, handler);
 	}
 
 	get(sessionId: string): TelegramClientService | undefined {
@@ -40,10 +56,19 @@ export class TelegramSessionPool {
 	}
 
 	async remove(sessionId: string): Promise<void> {
+		this.stopMessageHandler(sessionId);
 		const client = this.pool.get(sessionId);
 		if (client) {
 			await client.disconnect();
 			this.pool.delete(sessionId);
+		}
+	}
+
+	private stopMessageHandler(sessionId: string): void {
+		const handler = this.messageHandlers.get(sessionId);
+		if (handler) {
+			handler.stop();
+			this.messageHandlers.delete(sessionId);
 		}
 	}
 
@@ -84,7 +109,7 @@ export class TelegramSessionPool {
 				try {
 					const client = TelegramClientService.initialize(session.session_id);
 					await client.connect();
-					this.pool.set(session.session_id, client);
+					await this.add(session.session_id, client, session.telegram_user_id);
 				} catch (error) {
 					console.error(`Failed to restore session id=${session.id}:`, error);
 				}
@@ -100,6 +125,7 @@ export class TelegramSessionPool {
 
 	// Disconnects the client, removes from pool, and deletes the session from the database.
 	async invalidate(sessionId: string): Promise<void> {
+		this.stopMessageHandler(sessionId);
 		const client = this.pool.get(sessionId);
 		if (client) {
 			await client.disconnect();
