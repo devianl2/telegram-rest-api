@@ -68,25 +68,34 @@ export class TelegramSessionPool {
 	}
 
 	async restoreFromDatabase(): Promise<void> {
-		const db = DatabaseClient.getInstance();
-		const sessions = await db.execute<TelegramSessionRecord[]>((prisma) =>
-			prisma.telegramSession.findMany({
-				where: { status: SessionStatus.ACTIVE },
-			}),
-		);
+		const serverName = process.env.SERVER_NAME ?? "";
+		if (serverName) {
+			const db = DatabaseClient.getInstance();
+			const sessions = await db.execute<TelegramSessionRecord[]>((prisma) =>
+				prisma.telegramSession.findMany({
+					where: {
+						status: SessionStatus.ACTIVE,
+						tenant: { server_name: process.env.SERVER_NAME ?? "" },
+					},
+				}),
+			);
 
-		for (const session of sessions) {
-			try {
-				const client = TelegramClientService.initialize(session.session_id);
-				await client.connect();
-				this.pool.set(session.session_id, client);
-			} catch (error) {
-				console.error(`Failed to restore session id=${session.id}:`, error);
+			for (const session of sessions) {
+				try {
+					const client = TelegramClientService.initialize(session.session_id);
+					await client.connect();
+					this.pool.set(session.session_id, client);
+				} catch (error) {
+					console.error(`Failed to restore session id=${session.id}:`, error);
+				}
 			}
+
+			console.log(
+				`Session restore complete: ${this.pool.size}/${sessions.length} restored`,
+			);
+		} else {
+			console.log("No telegram sessions to restore");
 		}
-		console.log(
-			`Session restore complete: ${this.pool.size}/${sessions.length} restored`,
-		);
 	}
 
 	// Disconnects the client, removes from pool, and deletes the session from the database.
