@@ -1,4 +1,5 @@
 import { Api } from "telegram";
+import { computeCheck } from "telegram/Password";
 import { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { BaseRoute } from "../BaseRoute";
 import { SuccessResponse, ErrorResponse } from "../../http/ApiResponse";
@@ -13,6 +14,43 @@ import { SessionStatus } from "../../database/constants/SessionStatus";
  * Only successfully signed in accounts are added to the pool
  */
 export class AuthRoute extends BaseRoute {
+	/**
+	 * Saves an authenticated Telegram session to the database and adds
+	 * a fresh client to the session pool. Destroys the handshake client
+	 * before creating the pool-safe replacement.
+	 */
+	private async saveSession(
+		request: FastifyRequest,
+		authClient: TelegramClientService,
+		user: Api.User,
+	): Promise<void> {
+		const tenant = await this.getTenant(request);
+		const sessionId = authClient.getSession();
+		const telegramUserId = user.id.toString();
+
+		await DatabaseClient.getInstance().execute((prisma) =>
+			prisma.telegramSession.create({
+				data: {
+					tenant_id: tenant.id,
+					session_id: sessionId,
+					telegram_user_id: telegramUserId,
+					telegram_username: user.username ?? "",
+					telegram_access_hash: user.accessHash?.toString() ?? "",
+					status: SessionStatus.ACTIVE,
+				},
+			}),
+		);
+
+		await authClient.destroy();
+
+		const freshClient = await TelegramClientService.initialize(sessionId);
+		TelegramSessionPool.getInstance().add(
+			sessionId,
+			freshClient,
+			telegramUserId,
+		);
+	}
+
 	async register(fastify: FastifyInstance): Promise<void> {
 		/**
 		 * Sends a one-time verification code to the given phone number (Telegram login flow).
@@ -30,8 +68,7 @@ export class AuthRoute extends BaseRoute {
 					return new ErrorResponse("phoneNumber is required", 400).send(reply);
 				}
 
-				const telegram = TelegramClientService.initialize();
-				await telegram.connect();
+				const telegram = await TelegramClientService.initialize();
 
 				try {
 					const result = await telegram.getClient().invoke(
@@ -47,7 +84,7 @@ export class AuthRoute extends BaseRoute {
 						[
 							{
 								phoneCodeHash: result.phoneCodeHash,
-								session: telegram.getSession(),
+								sessionId: telegram.getSession(),
 							},
 						],
 						"Verification code sent",
@@ -71,10 +108,10 @@ export class AuthRoute extends BaseRoute {
 		fastify.post(
 			"/auth/ResendCode",
 			async (request: FastifyRequest, reply: FastifyReply) => {
-				const { phoneNumber, phoneCodeHash, sessionCode } = request.body as {
+				const { phoneNumber, phoneCodeHash, sessionId } = request.body as {
 					phoneNumber: string;
 					phoneCodeHash: string;
-					sessionCode: string;
+					sessionId: string;
 				};
 
 				if (!phoneNumber) {
@@ -82,8 +119,7 @@ export class AuthRoute extends BaseRoute {
 				}
 
 				// Initialize the Telegram client with the session code that was sent in send-code route
-				const telegram = TelegramClientService.initialize(sessionCode);
-				await telegram.connect();
+				const telegram = await TelegramClientService.initialize(sessionId);
 
 				try {
 					const result = await telegram.getClient().invoke(
@@ -93,7 +129,10 @@ export class AuthRoute extends BaseRoute {
 						}),
 					);
 
-					new SuccessResponse([result], "Verification code resent").send(reply);
+					new SuccessResponse(
+						[result, sessionId],
+						"Verification code resent",
+					).send(reply);
 				} catch (error: unknown) {
 					ErrorResponse.fromError(error).send(reply);
 				} finally {
@@ -112,24 +151,23 @@ export class AuthRoute extends BaseRoute {
 		fastify.post(
 			"/auth/SignIn",
 			async (request: FastifyRequest, reply: FastifyReply) => {
-				const { phoneNumber, phoneCodeHash, phoneCode, sessionCode } =
+				const { phoneNumber, phoneCodeHash, phoneCode, sessionId } =
 					request.body as {
 						phoneNumber: string;
 						phoneCodeHash: string;
 						phoneCode: string;
-						sessionCode: string;
+						sessionId: string;
 					};
 
-				if (!phoneNumber || !phoneCodeHash || !phoneCode || !sessionCode) {
+				if (!phoneNumber || !phoneCodeHash || !phoneCode || !sessionId) {
 					return new ErrorResponse(
-						"phoneNumber, phoneCode, and session code are required",
+						"phoneNumber, phoneCode, and sessionId are required",
 						400,
 					).send(reply);
 				}
 
 				// Initialize the Telegram client with the session code that was sent in send-code route
-				const telegram = TelegramClientService.initialize(sessionCode);
-				await telegram.connect();
+				const telegram = await TelegramClientService.initialize(sessionId);
 
 				try {
 					const result = await telegram.getClient().invoke(
@@ -140,38 +178,11 @@ export class AuthRoute extends BaseRoute {
 						}),
 					);
 
-					const tenant = await this.getTenant(request);
-					const sessionId = telegram.getSession();
-					const telegramUserId = result.user.id.toString();
-
-					const db = DatabaseClient.getInstance();
-					await db.execute((prisma) =>
-						prisma.telegramSession.create({
-							data: {
-								tenant_id: tenant.id,
-								session_id: sessionId,
-								telegram_user_id: telegramUserId,
-								telegram_username: result.user.username ?? "",
-								telegram_access_hash: result.user.accessHash.toString() ?? "",
-								status: SessionStatus.ACTIVE,
-							},
-						}),
-					);
-
-					// Kill the auth client — its internal state is tainted from the SignIn handshake.
-					await telegram.destroy();
-
-					// A fresh client with the saved session string mirrors what restoreFromDatabase does.
-					const freshClient = TelegramClientService.initialize(sessionId);
-					await freshClient.connect();
-					TelegramSessionPool.getInstance().add(
-						sessionId,
-						freshClient,
-						telegramUserId,
-					);
+					const activeSessionId = telegram.getSession();
+					await this.saveSession(request, telegram, result.user as Api.User);
 
 					new SuccessResponse(
-						[{ result, sessionId }],
+						[{ result, sessionId: activeSessionId }],
 						"Signed in successfully",
 					).send(reply);
 				} catch (error: unknown) {
@@ -191,24 +202,23 @@ export class AuthRoute extends BaseRoute {
 		fastify.post(
 			"/auth/SignUp",
 			async (request: FastifyRequest, reply: FastifyReply) => {
-				const { phoneNumber, phoneCodeHash, firstName, lastName, sessionCode } =
+				const { phoneNumber, phoneCodeHash, firstName, lastName, sessionId } =
 					request.body as {
 						phoneNumber: string;
 						phoneCodeHash: string;
 						firstName: string;
 						lastName: string;
-						sessionCode: string;
+						sessionId: string;
 					};
 
-				if (!phoneNumber || !phoneCodeHash || !firstName || !sessionCode) {
+				if (!phoneNumber || !phoneCodeHash || !firstName || !sessionId) {
 					return new ErrorResponse(
-						"phoneNumber, phoneCodeHash, firstName, and sessionCode are required",
+						"phoneNumber, phoneCodeHash, firstName, and sessionId are required",
 						400,
 					).send(reply);
 				}
 
-				const telegram = TelegramClientService.initialize(sessionCode);
-				await telegram.connect();
+				const telegram = await TelegramClientService.initialize(sessionId);
 
 				try {
 					const result = await telegram.getClient().invoke(
@@ -220,39 +230,11 @@ export class AuthRoute extends BaseRoute {
 						}),
 					);
 
-					const tenant = await this.getTenant(request);
-					const sessionId = telegram.getSession();
-					const telegramUserId = result.user.id.toString();
-
-					const db = DatabaseClient.getInstance();
-					await db.execute((prisma) =>
-						prisma.telegramSession.create({
-							data: {
-								tenant_id: tenant.id,
-								session_id: sessionId,
-								telegram_user_id: telegramUserId,
-								telegram_username: result.user.username ?? "",
-								telegram_access_hash: result.user.accessHash.toString() ?? "",
-								status: SessionStatus.ACTIVE,
-							},
-						}),
-					);
-
-					// Kill the auth client — its internal state is tainted from the SignUp handshake.
-					await telegram.destroy();
-
-					// A fresh client with the saved session string
-					const freshClient = TelegramClientService.initialize(sessionId);
-					await freshClient.connect();
-
-					TelegramSessionPool.getInstance().add(
-						sessionId,
-						freshClient,
-						telegramUserId,
-					);
+					const activeSessionId = telegram.getSession();
+					await this.saveSession(request, telegram, result.user as Api.User);
 
 					new SuccessResponse(
-						[{ result, sessionId }],
+						[{ result, sessionId: activeSessionId }],
 						"Signed up successfully",
 					).send(reply);
 				} catch (error: unknown) {
@@ -272,21 +254,20 @@ export class AuthRoute extends BaseRoute {
 		fastify.post(
 			"/auth/CancelCode",
 			async (request: FastifyRequest, reply: FastifyReply) => {
-				const { phoneNumber, phoneCodeHash, sessionCode } = request.body as {
+				const { phoneNumber, phoneCodeHash, sessionId } = request.body as {
 					phoneNumber: string;
 					phoneCodeHash: string;
-					sessionCode: string;
+					sessionId: string;
 				};
 
-				if (!phoneNumber || !phoneCodeHash || !sessionCode) {
+				if (!phoneNumber || !phoneCodeHash || !sessionId) {
 					return new ErrorResponse(
-						"phoneNumber, phoneCodeHash, and sessionCode are required",
+						"phoneNumber, phoneCodeHash, and sessionId are required",
 						400,
 					).send(reply);
 				}
 
-				const telegram = TelegramClientService.initialize(sessionCode);
-				await telegram.connect();
+				const telegram = await TelegramClientService.initialize(sessionId);
 
 				try {
 					const result = await telegram.getClient().invoke(
@@ -317,14 +298,14 @@ export class AuthRoute extends BaseRoute {
 		fastify.post(
 			"/auth/ResetAuthorizations",
 			async (request: FastifyRequest, reply: FastifyReply) => {
-				const { sessionCode } = request.body as { sessionCode: string };
+				const { sessionId } = request.body as { sessionId: string };
 
-				if (!sessionCode) {
-					return new ErrorResponse("sessionCode is required", 400).send(reply);
+				if (!sessionId) {
+					return new ErrorResponse("sessionId is required", 400).send(reply);
 				}
 
 				const pool = TelegramSessionPool.getInstance();
-				const { client, fromPool } = await pool.resolve(sessionCode);
+				const { client, fromPool } = await pool.resolve(sessionId);
 
 				try {
 					const result = await client
@@ -336,7 +317,7 @@ export class AuthRoute extends BaseRoute {
 					);
 				} catch (error: unknown) {
 					if (TelegramUtils.isUnauthorized(error)) {
-						await pool.invalidate(sessionCode);
+						await pool.invalidate(sessionId);
 					}
 					ErrorResponse.fromError(error).send(reply);
 				} finally {
@@ -357,32 +338,72 @@ export class AuthRoute extends BaseRoute {
 		fastify.post(
 			"/auth/LogOut",
 			async (request: FastifyRequest, reply: FastifyReply) => {
-				const { sessionCode } = request.body as { sessionCode: string };
+				const { sessionId } = request.body as { sessionId: string };
 
-				if (!sessionCode) {
-					return new ErrorResponse("sessionCode is required", 400).send(reply);
+				if (!sessionId) {
+					return new ErrorResponse("sessionId is required", 400).send(reply);
 				}
 
 				const pool = TelegramSessionPool.getInstance();
-				const { client, fromPool } = await pool.resolve(sessionCode);
+				const { client, fromPool } = await pool.resolve(sessionId);
 
 				try {
 					const result = await client
 						.getClient()
 						.invoke(new Api.auth.LogOut({}));
 
-					await pool.invalidate(sessionCode);
+					await pool.invalidate(sessionId);
 
 					new SuccessResponse([result], "Logged out successfully").send(reply);
 				} catch (error: unknown) {
 					if (TelegramUtils.isUnauthorized(error)) {
-						await pool.invalidate(sessionCode);
+						await pool.invalidate(sessionId);
 					}
 					ErrorResponse.fromError(error).send(reply);
 				} finally {
 					if (!fromPool) {
 						await client.destroy();
 					}
+				}
+			},
+		);
+
+		fastify.post(
+			"/auth/TwoFactorAuth",
+			async (request: FastifyRequest, reply: FastifyReply) => {
+				const { sessionId, password } = request.body as {
+					sessionId: string;
+					password: string;
+				};
+
+				if (!sessionId) {
+					return new ErrorResponse("sessionId is required", 400).send(reply);
+				}
+
+				// Initialize the Telegram client with the session code that was sent in send-code route
+				const telegram = await TelegramClientService.initialize(sessionId);
+
+				try {
+					const passwordSrp = await telegram
+						.getClient()
+						.invoke(new Api.account.GetPassword());
+
+					const passwordCheck = await computeCheck(passwordSrp, password);
+
+					const result = await telegram.getClient().invoke(
+						new Api.auth.CheckPassword({
+							password: passwordCheck,
+						}),
+					);
+					await this.saveSession(request, telegram, result.user as Api.User);
+
+					new SuccessResponse(
+						[{ result, sessionId }],
+						"Two-factor authentication successful",
+					).send(reply);
+				} catch (error: unknown) {
+					await telegram.destroy();
+					ErrorResponse.fromError(error).send(reply);
 				}
 			},
 		);

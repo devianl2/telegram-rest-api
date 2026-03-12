@@ -105,7 +105,7 @@ export class TelegramSessionPool {
 		return { client, fromPool: false };
 	}
 
-	async restoreFromDatabase(): Promise<void> {
+	async restoreFromDatabase(sessionId: string = ""): Promise<void> {
 		const serverName = process.env.SERVER_NAME ?? "";
 		if (serverName) {
 			const db = DatabaseClient.getInstance();
