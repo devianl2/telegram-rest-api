@@ -16,7 +16,10 @@ export class ApiKeyMiddleware extends BaseMiddleware {
 		const acceptHeader = request.headers["accept"];
 
 		if (!secretId || !secretCode) {
-			return new ErrorResponse("Unauthorized", 401).send(reply);
+			return new ErrorResponse(
+				"Secret id and code are required in the request headers.",
+				401,
+			).send(reply);
 		}
 
 		if (acceptHeader !== "application/json") {
@@ -32,8 +35,7 @@ export class ApiKeyMiddleware extends BaseMiddleware {
 				return new ErrorResponse("Unauthorized", 401).send(reply);
 			}
 		} catch (error) {
-			console.error("Failed to resolve tenant:", (error as Error).message);
-			return new ErrorResponse("Internal Server Error", 500).send(reply);
+			return new ErrorResponse("Failed to resolve tenant.", 500).send(reply);
 		}
 	};
 }

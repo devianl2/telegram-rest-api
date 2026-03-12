@@ -12,9 +12,10 @@ export abstract class BaseRoute {
 	protected async getTenant(request: FastifyRequest): Promise<Tenant> {
 		const secretId = request.headers["secret-id"] as string;
 		const secretCode = request.headers["secret-code"] as string;
+
 		const tenant = await TenantService.getTenant(secretId, secretCode);
 		if (!tenant) {
-			throw new Error("Tenant not found.");
+			throw new Error("Invalid secret id or code.");
 		}
 		return tenant;
 	}

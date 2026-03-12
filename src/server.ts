@@ -3,12 +3,12 @@ import { Application } from "./app";
 import { ApiKeyMiddleware } from "./middleware/ApiKeyMiddleware";
 import { AuthRoute } from "./routes/auth/AuthRoute";
 import { UserRoute } from "./routes/user/UserRoute";
-import { TelegramSessionPool } from "./telegram/TelegramSessionPool";
+import { TelegramClientService } from "./telegram/TelegramClientService";
 
 const PORT = parseInt(process.env.PORT ?? "3000", 10);
 
 async function bootstrap(): Promise<void> {
-	await TelegramSessionPool.getInstance().restoreFromDatabase();
+	await TelegramClientService.restoreFromDatabase();
 
 	const app = new Application();
 	app

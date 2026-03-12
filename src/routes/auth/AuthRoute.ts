@@ -4,7 +4,6 @@ import { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { BaseRoute } from "../BaseRoute";
 import { SuccessResponse, ErrorResponse } from "../../http/ApiResponse";
 import { TelegramClientService } from "../../telegram/TelegramClientService";
-import { TelegramSessionPool } from "../../telegram/TelegramSessionPool";
 import { TelegramUtils } from "../../telegram/TelegramUtils";
 import { DatabaseClient } from "../../database/DatabaseClient";
 import { SessionStatus } from "../../database/constants/SessionStatus";
@@ -44,11 +43,8 @@ export class AuthRoute extends BaseRoute {
 		await authClient.destroy();
 
 		const freshClient = await TelegramClientService.initialize(sessionId);
-		TelegramSessionPool.getInstance().add(
-			sessionId,
-			freshClient,
-			telegramUserId,
-		);
+		// Add the authenticated session to the pool
+		TelegramClientService.addToPool(sessionId, freshClient, telegramUserId);
 	}
 
 	async register(fastify: FastifyInstance): Promise<void> {
@@ -245,90 +241,6 @@ export class AuthRoute extends BaseRoute {
 		);
 
 		/**
-		 * Cancels the login code sent to the user.
-		 * Inherits the session code from the send-code route.
-		 * @param request - The request object
-		 * @param reply - The reply object
-		 * @returns The response object
-		 */
-		fastify.post(
-			"/auth/CancelCode",
-			async (request: FastifyRequest, reply: FastifyReply) => {
-				const { phoneNumber, phoneCodeHash, sessionId } = request.body as {
-					phoneNumber: string;
-					phoneCodeHash: string;
-					sessionId: string;
-				};
-
-				if (!phoneNumber || !phoneCodeHash || !sessionId) {
-					return new ErrorResponse(
-						"phoneNumber, phoneCodeHash, and sessionId are required",
-						400,
-					).send(reply);
-				}
-
-				const telegram = await TelegramClientService.initialize(sessionId);
-
-				try {
-					const result = await telegram.getClient().invoke(
-						new Api.auth.CancelCode({
-							phoneNumber,
-							phoneCodeHash,
-						}),
-					);
-
-					new SuccessResponse([result], "Verification code cancelled").send(
-						reply,
-					);
-				} catch (error: unknown) {
-					ErrorResponse.fromError(error).send(reply);
-				} finally {
-					await telegram.destroy();
-				}
-			},
-		);
-
-		/**
-		 * Terminates all user's authorized sessions except for the current one.
-		 * The current session must be authorized.
-		 * @param request - The request object
-		 * @param reply - The reply object
-		 * @returns The response object
-		 */
-		fastify.post(
-			"/auth/ResetAuthorizations",
-			async (request: FastifyRequest, reply: FastifyReply) => {
-				const { sessionId } = request.body as { sessionId: string };
-
-				if (!sessionId) {
-					return new ErrorResponse("sessionId is required", 400).send(reply);
-				}
-
-				const pool = TelegramSessionPool.getInstance();
-				const { client, fromPool } = await pool.resolve(sessionId);
-
-				try {
-					const result = await client
-						.getClient()
-						.invoke(new Api.auth.ResetAuthorizations({}));
-
-					new SuccessResponse([result], "All other sessions terminated").send(
-						reply,
-					);
-				} catch (error: unknown) {
-					if (TelegramUtils.isUnauthorized(error)) {
-						await pool.invalidate(sessionId);
-					}
-					ErrorResponse.fromError(error).send(reply);
-				} finally {
-					if (!fromPool) {
-						await client.destroy();
-					}
-				}
-			},
-		);
-
-		/**
 		 * Terminates the current session.
 		 * The current session must be authorized.
 		 * @param request - The request object
@@ -344,26 +256,21 @@ export class AuthRoute extends BaseRoute {
 					return new ErrorResponse("sessionId is required", 400).send(reply);
 				}
 
-				const pool = TelegramSessionPool.getInstance();
-				const { client, fromPool } = await pool.resolve(sessionId);
+				const client = await TelegramClientService.initialize(sessionId);
 
 				try {
 					const result = await client
 						.getClient()
 						.invoke(new Api.auth.LogOut({}));
 
-					await pool.invalidate(sessionId);
+					await TelegramClientService.invalidate(sessionId);
 
 					new SuccessResponse([result], "Logged out successfully").send(reply);
 				} catch (error: unknown) {
 					if (TelegramUtils.isUnauthorized(error)) {
-						await pool.invalidate(sessionId);
+						await TelegramClientService.invalidate(sessionId);
 					}
 					ErrorResponse.fromError(error).send(reply);
-				} finally {
-					if (!fromPool) {
-						await client.destroy();
-					}
 				}
 			},
 		);
@@ -382,6 +289,7 @@ export class AuthRoute extends BaseRoute {
 
 				// Initialize the Telegram client with the session code that was sent in send-code route
 				const telegram = await TelegramClientService.initialize(sessionId);
+				const isPooled = TelegramClientService.isPooled(sessionId);
 
 				try {
 					const passwordSrp = await telegram
