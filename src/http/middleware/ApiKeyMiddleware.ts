@@ -1,6 +1,6 @@
 import { FastifyReply, FastifyRequest } from "fastify";
-import { ErrorResponse } from "../http/ApiResponse";
-import { TenantService } from "../services/TenantService";
+import { ErrorResponse } from "../ApiResponse";
+import { TenantService } from "../../services/TenantService";
 
 export abstract class BaseMiddleware {
 	abstract handle(request: FastifyRequest, reply: FastifyReply): Promise<void>;

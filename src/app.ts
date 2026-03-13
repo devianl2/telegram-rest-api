@@ -5,7 +5,7 @@ import Fastify, {
 	FastifyRequest,
 } from "fastify";
 import { BaseRoute } from "./routes/BaseRoute";
-import { ApiKeyMiddleware } from "./middleware/ApiKeyMiddleware";
+import { ApiKeyMiddleware } from "./http/middleware/ApiKeyMiddleware";
 import { ErrorResponse } from "./http/ApiResponse";
 
 export class Application {

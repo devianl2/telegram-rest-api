@@ -1,6 +1,6 @@
 import "dotenv/config";
 import { Application } from "./app";
-import { ApiKeyMiddleware } from "./middleware/ApiKeyMiddleware";
+import { ApiKeyMiddleware } from "./http/middleware/ApiKeyMiddleware";
 import { AuthRoute } from "./routes/auth/AuthRoute";
 import { UserRoute } from "./routes/user/UserRoute";
 import { TelegramClientService } from "./telegram/TelegramClientService";
