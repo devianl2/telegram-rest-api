@@ -4,7 +4,6 @@ import { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { BaseRoute } from "../BaseRoute";
 import { SuccessResponse, ErrorResponse } from "../../http/ApiResponse";
 import { TelegramClientService } from "../../telegram/TelegramClientService";
-import { TelegramUtils } from "../../telegram/TelegramUtils";
 import { DatabaseClient } from "../../database/DatabaseClient";
 import { SessionStatus } from "../../database/constants/SessionStatus";
 
@@ -256,20 +255,18 @@ export class AuthRoute extends BaseRoute {
 					return new ErrorResponse("sessionId is required", 400).send(reply);
 				}
 
-				const client = await TelegramClientService.initialize(sessionId);
-
 				try {
-					const result = await client
-						.getClient()
-						.invoke(new Api.auth.LogOut({}));
+					// withTelegramSession handles unauthorized invalidation and
+					// temporary client cleanup automatically via its catch/finally.
+					const result = await this.withTelegramSession(sessionId, (client) =>
+						client.getClient().invoke(new Api.auth.LogOut({})),
+					);
 
+					// Explicit invalidate on success: removes from pool and deletes DB record.
 					await TelegramClientService.invalidate(sessionId);
 
 					new SuccessResponse([result], "Logged out successfully").send(reply);
 				} catch (error: unknown) {
-					if (TelegramUtils.isUnauthorized(error)) {
-						await TelegramClientService.invalidate(sessionId);
-					}
 					ErrorResponse.fromError(error).send(reply);
 				}
 			},
@@ -287,9 +284,7 @@ export class AuthRoute extends BaseRoute {
 					return new ErrorResponse("sessionId is required", 400).send(reply);
 				}
 
-				// Initialize the Telegram client with the session code that was sent in send-code route
 				const telegram = await TelegramClientService.initialize(sessionId);
-				const isPooled = TelegramClientService.isPooled(sessionId);
 
 				try {
 					const passwordSrp = await telegram
