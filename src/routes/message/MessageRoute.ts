@@ -246,5 +246,48 @@ export class MessageRoute extends BaseRoute {
 				}
 			},
 		);
+
+		/**
+		 * Deletes messages by ID.
+		 * `revoke: true`  — deletes for everyone.
+		 * `revoke: false` — deletes only for the current user (default).
+		 *
+		 * Note: this method works for private chats and basic groups.
+		 * For supergroups/channels use channels.DeleteMessages instead.
+		 */
+		fastify.post(
+			"/messages/DeleteMessages",
+			async (request: FastifyRequest, reply: FastifyReply) => {
+				const {
+					sessionId,
+					id,
+					revoke = false,
+				} = request.body as {
+					sessionId: string;
+					id: number[];
+					revoke?: boolean;
+				};
+
+				if (!sessionId || !id?.length) {
+					return new ErrorResponse("sessionId and id are required", 400).send(
+						reply,
+					);
+				}
+
+				try {
+					const result = await this.withTelegramSession(sessionId, (client) =>
+						client
+							.getClient()
+							.invoke(new Api.messages.DeleteMessages({ id, revoke })),
+					);
+
+					new SuccessResponse([result], "Messages deleted successfully").send(
+						reply,
+					);
+				} catch (error: unknown) {
+					ErrorResponse.fromError(error).send(reply);
+				}
+			},
+		);
 	}
 }

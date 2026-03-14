@@ -8,30 +8,95 @@ import { TelegramUtils } from "../../telegram/TelegramUtils";
 export class ChatRoute extends BaseRoute {
 	async register(fastify: FastifyInstance): Promise<void> {
 		/**
-		 * Fetches all chats except the ones with the specified IDs.
+		 * Fetches a page of dialogs using Telegram's native cursor-based pagination.
+		 * Each response includes a `nextCursor` — pass it back verbatim to fetch
+		 * the next page. When `nextCursor` is null there are no more pages.
+		 *
+		 * First request: omit offsetDate / offsetId (they default to 0).
+		 * Subsequent requests: pass `offsetDate` and `offsetId` from the
+		 * previous response's `nextCursor`.
 		 */
 		fastify.post(
-			"/chats/GetAllChats",
+			"/chats/GetDialogs",
 			async (request: FastifyRequest, reply: FastifyReply) => {
-				const { sessionId, exceptIds } = request.body as {
+				const {
+					sessionId,
+					limit = 20,
+					excludePinned = false,
+					folderId,
+					offsetDate = 0,
+					offsetId = 0,
+				} = request.body as {
 					sessionId: string;
-					exceptIds: string[];
+					limit?: number;
+					excludePinned?: boolean;
+					folderId?: number;
+					offsetDate?: number;
+					offsetId?: number;
 				};
 
 				if (!sessionId) {
-					return new ErrorResponse("sessionId required", 400).send(reply);
+					return new ErrorResponse("sessionId is required", 400).send(reply);
 				}
 
 				try {
-					const result = await this.withTelegramSession(sessionId, (client) =>
-						client.getClient().invoke(
-							new Api.messages.GetAllChats({
-								exceptIds: exceptIds.map(BigInt),
-							}),
-						),
+					const data = await this.withTelegramSession(
+						sessionId,
+						async (client) => {
+							const result = await client.getClient().invoke(
+								new Api.messages.GetDialogs({
+									offsetDate,
+									offsetId,
+									offsetPeer: new Api.InputPeerEmpty(),
+									limit,
+									hash: BigInt(0),
+									excludePinned,
+									...(folderId !== undefined && { folderId }),
+								}),
+							);
+
+							// DialogsNotModified has no dialogs — return empty
+							if (!("dialogs" in result)) {
+								return {
+									dialogs: [],
+									messages: [],
+									chats: [],
+									users: [],
+									count: 0,
+									nextCursor: null,
+								};
+							}
+
+							const { dialogs, messages, chats, users } = result;
+							const count = "count" in result ? result.count : dialogs.length;
+
+							// Build next cursor from the last dialog's top message
+							let nextCursor: { offsetDate: number; offsetId: number } | null =
+								null;
+							const lastDialog = dialogs[dialogs.length - 1];
+							if (
+								dialogs.length === limit &&
+								lastDialog &&
+								"topMessage" in lastDialog
+							) {
+								const topMsgId = lastDialog.topMessage;
+								const lastMsg = messages.find(
+									(m: Api.TypeMessage): m is Api.Message =>
+										m instanceof Api.Message && m.id === topMsgId,
+								);
+								if (lastMsg) {
+									nextCursor = {
+										offsetDate: lastMsg.date,
+										offsetId: lastMsg.id,
+									};
+								}
+							}
+
+							return { dialogs, messages, chats, users, count, nextCursor };
+						},
 					);
 
-					new SuccessResponse([result], "All chats fetched successfully").send(
+					new SuccessResponse([data], "Dialogs fetched successfully").send(
 						reply,
 					);
 				} catch (error: unknown) {
@@ -41,7 +106,8 @@ export class ChatRoute extends BaseRoute {
 		);
 
 		/**
-		 * Fetches chats by their IDs.
+		 * Fetches basic group chats by their IDs (className === "Chat").
+		 * Does NOT work for supergroups or channels — use /chats/GetChannels for those.
 		 */
 		fastify.post(
 			"/chats/GetChats",

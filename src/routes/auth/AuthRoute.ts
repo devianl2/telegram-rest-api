@@ -153,10 +153,11 @@ export class AuthRoute extends BaseRoute {
 						phoneCode: string;
 						sessionId: string;
 					};
+				console.log(phoneNumber, phoneCodeHash, phoneCode, sessionId);
 
 				if (!phoneNumber || !phoneCodeHash || !phoneCode || !sessionId) {
 					return new ErrorResponse(
-						"phoneNumber, phoneCode, and sessionId are required",
+						"phoneNumber, phoneCodeHash, phoneCode, and sessionId are required",
 						400,
 					).send(reply);
 				}
