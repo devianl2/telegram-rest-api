@@ -8,6 +8,110 @@ import { TelegramUtils } from "../../telegram/TelegramUtils";
 export class ChatRoute extends BaseRoute {
 	async register(fastify: FastifyInstance): Promise<void> {
 		/**
+		 * Fetches all chats except the ones with the specified IDs.
+		 */
+		fastify.post(
+			"/chats/GetAllChats",
+			async (request: FastifyRequest, reply: FastifyReply) => {
+				const { sessionId, exceptIds } = request.body as {
+					sessionId: string;
+					exceptIds: string[];
+				};
+
+				if (!sessionId) {
+					return new ErrorResponse("sessionId required", 400).send(reply);
+				}
+
+				try {
+					const result = await this.withTelegramSession(sessionId, (client) =>
+						client.getClient().invoke(
+							new Api.messages.GetAllChats({
+								exceptIds: exceptIds.map(BigInt),
+							}),
+						),
+					);
+
+					new SuccessResponse([result], "All chats fetched successfully").send(
+						reply,
+					);
+				} catch (error: unknown) {
+					ErrorResponse.fromError(error).send(reply);
+				}
+			},
+		);
+
+		/**
+		 * Fetches chats by their IDs.
+		 */
+		fastify.post(
+			"/chats/GetChats",
+			async (request: FastifyRequest, reply: FastifyReply) => {
+				const { sessionId, id } = request.body as {
+					sessionId: string;
+					id: string[];
+				};
+
+				if (!sessionId || !id?.length) {
+					return new ErrorResponse("sessionId and id are required", 400).send(
+						reply,
+					);
+				}
+
+				try {
+					const result = await this.withTelegramSession(sessionId, (client) =>
+						client.getClient().invoke(
+							new Api.messages.GetChats({
+								id: id.map(BigInt),
+							}),
+						),
+					);
+
+					new SuccessResponse([result], "Chats fetched successfully").send(
+						reply,
+					);
+				} catch (error: unknown) {
+					ErrorResponse.fromError(error).send(reply);
+				}
+			},
+		);
+
+		/**
+		 * Fetches chats by their IDs.
+		 */
+		fastify.post(
+			"/chats/GetFullChat",
+			async (request: FastifyRequest, reply: FastifyReply) => {
+				const { sessionId, chatId } = request.body as {
+					sessionId: string;
+					chatId: string;
+				};
+
+				if (!sessionId || !chatId) {
+					return new ErrorResponse(
+						"sessionId and chatId are required",
+						400,
+					).send(reply);
+				}
+
+				try {
+					const result = await this.withTelegramSession(sessionId, (client) =>
+						client.getClient().invoke(
+							new Api.messages.GetFullChat({
+								chatId: BigInt(chatId),
+							}),
+						),
+					);
+
+					new SuccessResponse([result], "Full chat fetched successfully").send(
+						reply,
+					);
+				} catch (error: unknown) {
+					ErrorResponse.fromError(error).send(reply);
+				}
+			},
+		);
+
+		/**
 		 * Creates a new group chat and invites the specified users.
 		 */
 		fastify.post(
@@ -27,12 +131,10 @@ export class ChatRoute extends BaseRoute {
 				}
 
 				try {
-					const result = await this.withTelegramSession(
-						sessionId,
-						(client) =>
-							client
-								.getClient()
-								.invoke(new Api.messages.CreateChat({ users, title })),
+					const result = await this.withTelegramSession(sessionId, (client) =>
+						client
+							.getClient()
+							.invoke(new Api.messages.CreateChat({ users, title })),
 					);
 
 					new SuccessResponse([result], "Chat created successfully").send(
@@ -51,13 +153,12 @@ export class ChatRoute extends BaseRoute {
 		fastify.post(
 			"/chats/DeleteChat",
 			async (request: FastifyRequest, reply: FastifyReply) => {
-				const { sessionId, chatId, userId, revokeHistory } =
-					request.body as {
-						sessionId: string;
-						chatId: string;
-						userId?: string;
-						revokeHistory?: boolean;
-					};
+				const { sessionId, chatId, userId, revokeHistory } = request.body as {
+					sessionId: string;
+					chatId: string;
+					userId?: string;
+					revokeHistory?: boolean;
+				};
 
 				if (!sessionId || !chatId) {
 					return new ErrorResponse(
@@ -67,21 +168,61 @@ export class ChatRoute extends BaseRoute {
 				}
 
 				try {
-					const result = await this.withTelegramSession(
-						sessionId,
-						(client) =>
-							client.getClient().invoke(
-								new Api.messages.DeleteChat({
-									chatId: BigInt(chatId),
-									userId: userId,
-									revokeHistory: revokeHistory,
-								}),
-							),
+					const result = await this.withTelegramSession(sessionId, (client) =>
+						client.getClient().invoke(
+							new Api.messages.DeleteChat({
+								chatId: BigInt(chatId),
+								userId: userId,
+								revokeHistory: revokeHistory,
+							}),
+						),
 					);
 
 					new SuccessResponse([result], "Chat deleted successfully").send(
 						reply,
 					);
+				} catch (error: unknown) {
+					ErrorResponse.fromError(error).send(reply);
+				}
+			},
+		);
+
+		/**
+		 * Deletes a chat, or removes a specific user from a chat.
+		 * Pass `userId` to remove only that user; omit it to delete the chat entirely.
+		 */
+		fastify.post(
+			"/chats/DeleteChatUser",
+			async (request: FastifyRequest, reply: FastifyReply) => {
+				const { sessionId, chatId, userId, revokeHistory } = request.body as {
+					sessionId: string;
+					chatId: string;
+					userId?: string;
+					revokeHistory?: boolean;
+				};
+
+				if (!sessionId || !chatId || !userId) {
+					return new ErrorResponse(
+						"sessionId, chatId and userId are required",
+						400,
+					).send(reply);
+				}
+
+				try {
+					const result = await this.withTelegramSession(sessionId, (client) =>
+						client.getClient().invoke(
+							new Api.messages.DeleteChatUser({
+								chatId: BigInt(chatId),
+								userId: userId,
+								revokeHistory: revokeHistory,
+							}),
+						),
+					);
+
+					new SuccessResponse(
+						[result],
+						"User deleted from chat successfully",
+					).send(reply);
 				} catch (error: unknown) {
 					ErrorResponse.fromError(error).send(reply);
 				}
@@ -109,16 +250,14 @@ export class ChatRoute extends BaseRoute {
 				}
 
 				try {
-					const result = await this.withTelegramSession(
-						sessionId,
-						(client) =>
-							client.getClient().invoke(
-								new Api.messages.EditChatAdmin({
-									chatId: BigInt(chatId),
-									userId,
-									isAdmin,
-								}),
-							),
+					const result = await this.withTelegramSession(sessionId, (client) =>
+						client.getClient().invoke(
+							new Api.messages.EditChatAdmin({
+								chatId: BigInt(chatId),
+								userId,
+								isAdmin,
+							}),
+						),
 					);
 
 					new SuccessResponse(
@@ -143,6 +282,7 @@ export class ChatRoute extends BaseRoute {
 					peer,
 					bannedRights: {
 						untilDate = 0,
+						viewMessages = false,
 						sendMessages = false,
 						sendMedia = false,
 						sendStickers = false,
@@ -159,6 +299,7 @@ export class ChatRoute extends BaseRoute {
 					peer: string;
 					bannedRights?: {
 						untilDate?: number;
+						viewMessages?: boolean;
 						sendMessages?: boolean;
 						sendMedia?: boolean;
 						sendStickers?: boolean;
@@ -173,34 +314,32 @@ export class ChatRoute extends BaseRoute {
 				};
 
 				if (!sessionId || !peer) {
-					return new ErrorResponse(
-						"sessionId and peer are required",
-						400,
-					).send(reply);
+					return new ErrorResponse("sessionId and peer are required", 400).send(
+						reply,
+					);
 				}
 
 				try {
-					const result = await this.withTelegramSession(
-						sessionId,
-						(client) =>
-							client.getClient().invoke(
-								new Api.messages.EditChatDefaultBannedRights({
-									peer,
-									bannedRights: new Api.ChatBannedRights({
-										untilDate,
-										sendMessages,
-										sendMedia,
-										sendStickers,
-										sendGifs,
-										sendGames,
-										sendInline,
-										sendPolls,
-										changeInfo,
-										inviteUsers,
-										pinMessages,
-									}),
+					const result = await this.withTelegramSession(sessionId, (client) =>
+						client.getClient().invoke(
+							new Api.messages.EditChatDefaultBannedRights({
+								peer,
+								bannedRights: new Api.ChatBannedRights({
+									untilDate,
+									viewMessages,
+									sendMessages,
+									sendMedia,
+									sendStickers,
+									sendGifs,
+									sendGames,
+									sendInline,
+									sendPolls,
+									changeInfo,
+									inviteUsers,
+									pinMessages,
 								}),
-							),
+							}),
+						),
 					);
 
 					new SuccessResponse(
@@ -290,15 +429,13 @@ export class ChatRoute extends BaseRoute {
 				}
 
 				try {
-					const result = await this.withTelegramSession(
-						sessionId,
-						(client) =>
-							client.getClient().invoke(
-								new Api.messages.EditChatTitle({
-									chatId: BigInt(chatId),
-									title,
-								}),
-							),
+					const result = await this.withTelegramSession(sessionId, (client) =>
+						client.getClient().invoke(
+							new Api.messages.EditChatTitle({
+								chatId: BigInt(chatId),
+								title,
+							}),
+						),
 					);
 
 					new SuccessResponse([result], "Chat title updated successfully").send(

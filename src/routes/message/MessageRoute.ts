@@ -27,6 +27,10 @@ export class MessageRoute extends BaseRoute {
 					sessionId,
 					peer,
 					message = "",
+					replyToMessageId = 0,
+					silent = false,
+					background = false,
+					scheduleDate = 0,
 					photos = [],
 					videos = [],
 					files = [],
@@ -34,6 +38,10 @@ export class MessageRoute extends BaseRoute {
 					sessionId: string;
 					peer: string;
 					message?: string;
+					replyToMessageId?: number;
+					silent?: boolean;
+					background?: boolean;
+					scheduleDate?: number;
 					photos?: string[];
 					videos?: string[];
 					files?: string[];
@@ -62,6 +70,10 @@ export class MessageRoute extends BaseRoute {
 									new Api.messages.SendMessage({
 										peer,
 										message,
+										silent,
+										background,
+										...(scheduleDate && { scheduleDate: scheduleDate }),
+										...(replyToMessageId && { replyToMsgId: replyToMessageId }),
 										randomId: TelegramUtils.randomId(),
 									}),
 								);
@@ -78,6 +90,10 @@ export class MessageRoute extends BaseRoute {
 										peer,
 										media,
 										message,
+										silent,
+										background,
+										...(scheduleDate && { scheduleDate: scheduleDate }),
+										...(replyToMessageId && { replyToMsgId: replyToMessageId }),
 										randomId: TelegramUtils.randomId(),
 									}),
 								);
@@ -94,8 +110,12 @@ export class MessageRoute extends BaseRoute {
 								(media: Api.TypeInputMedia, index: number) =>
 									new Api.InputSingleMedia({
 										media,
+										silent,
+										background,
 										randomId: TelegramUtils.randomId(),
 										message: index === 0 ? message : "",
+										...(scheduleDate && { scheduleDate: scheduleDate }),
+										...(replyToMessageId && { replyToMsgId: replyToMessageId }),
 									}),
 							);
 
@@ -108,6 +128,119 @@ export class MessageRoute extends BaseRoute {
 					new SuccessResponse([result], "Message sent successfully").send(
 						reply,
 					);
+				} catch (error: unknown) {
+					ErrorResponse.fromError(error).send(reply);
+				}
+			},
+		);
+		/**
+		 * Reacts to a message with a UTF-8 emoji.
+		 * Omit `reaction` to remove an existing reaction.
+		 */
+		fastify.post(
+			"/messages/SendReaction",
+			async (request: FastifyRequest, reply: FastifyReply) => {
+				const {
+					sessionId,
+					peer,
+					msgId,
+					reaction,
+					big = false,
+				} = request.body as {
+					sessionId: string;
+					peer: string;
+					msgId: number;
+					reaction?: string;
+					big?: boolean;
+				};
+
+				if (!sessionId || !peer || !msgId) {
+					return new ErrorResponse(
+						"sessionId, peer and msgId are required",
+						400,
+					).send(reply);
+				}
+
+				try {
+					const result = await this.withTelegramSession(sessionId, (client) =>
+						client.getClient().invoke(
+							new Api.messages.SendReaction({
+								peer,
+								msgId,
+								big,
+								...(reaction && { reaction }),
+							}),
+						),
+					);
+
+					new SuccessResponse([result], "Reaction sent successfully").send(
+						reply,
+					);
+				} catch (error: unknown) {
+					ErrorResponse.fromError(error).send(reply);
+				}
+			},
+		);
+		/**
+		 * Marks messages in a chat as read up to (and including) the given message ID.
+		 * Pass maxId: 0 to mark the entire history as read.
+		 */
+		fastify.post(
+			"/messages/ReadHistory",
+			async (request: FastifyRequest, reply: FastifyReply) => {
+				const {
+					sessionId,
+					peer,
+					maxId = 0,
+				} = request.body as {
+					sessionId: string;
+					peer: string;
+					maxId?: number;
+				};
+
+				if (!sessionId || !peer) {
+					return new ErrorResponse("sessionId and peer are required", 400).send(
+						reply,
+					);
+				}
+
+				try {
+					const result = await this.withTelegramSession(sessionId, (client) =>
+						client
+							.getClient()
+							.invoke(new Api.messages.ReadHistory({ peer, maxId })),
+					);
+
+					new SuccessResponse([result], "History marked as read").send(reply);
+				} catch (error: unknown) {
+					ErrorResponse.fromError(error).send(reply);
+				}
+			},
+		);
+
+		fastify.post(
+			"/messages/ReceivedMessages",
+			async (request: FastifyRequest, reply: FastifyReply) => {
+				const { sessionId, maxId = 0 } = request.body as {
+					sessionId: string;
+					maxId?: number;
+				};
+
+				if (!sessionId) {
+					return new ErrorResponse("sessionId is required", 400).send(reply);
+				}
+
+				try {
+					const result = await this.withTelegramSession(sessionId, (client) =>
+						client
+							.getClient()
+							.invoke(new Api.messages.ReceivedMessages({ maxId })),
+					);
+
+					new SuccessResponse(
+						[result],
+						"Received messages fetched successfully",
+					).send(reply);
 				} catch (error: unknown) {
 					ErrorResponse.fromError(error).send(reply);
 				}
