@@ -479,6 +479,16 @@ export class ChannelRoute extends BaseRoute {
 					).send(reply);
 				}
 
+				if (
+					bannedRights?.untilDate &&
+					bannedRights.untilDate < Math.floor(Date.now() / 1000)
+				) {
+					return new ErrorResponse(
+						"untilDate must be a future Unix timestamp in seconds (e.g. Math.floor(Date.now()/1000) + 86400 for 1 day). Pass 0 or omit it for a permanent ban.",
+						400,
+					).send(reply);
+				}
+
 				try {
 					const result = await this.withTelegramSession(sessionId, (client) =>
 						client.getClient().invoke(
@@ -486,7 +496,10 @@ export class ChannelRoute extends BaseRoute {
 								channel: this.inputChannel(channelId, accessHash),
 								participant: this.inputPeerUser(userId, userAccessHash),
 								bannedRights: new Api.ChatBannedRights({
-									untilDate: bannedRights?.untilDate ?? 0,
+									// untilDate is a conditional TL field — only include it when
+									// a real future Unix timestamp is provided. Passing 0 causes
+									// Telegram to reject the request with UNTIL_DATE_INVALID.
+									...(bannedRights?.untilDate ? { untilDate: bannedRights.untilDate } : {}),
 									viewMessages: bannedRights?.viewMessages ?? false,
 									sendMessages: bannedRights?.sendMessages ?? false,
 									sendMedia: bannedRights?.sendMedia ?? false,

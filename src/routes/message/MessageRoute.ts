@@ -27,7 +27,7 @@ export class MessageRoute extends BaseRoute {
 					sessionId,
 					peer,
 					message = "",
-					replyToMessageId = 0,
+					replyToMsgId = 0,
 					silent = false,
 					background = false,
 					scheduleDate = 0,
@@ -38,7 +38,7 @@ export class MessageRoute extends BaseRoute {
 					sessionId: string;
 					peer: string;
 					message?: string;
-					replyToMessageId?: number;
+					replyToMsgId?: number;
 					silent?: boolean;
 					background?: boolean;
 					scheduleDate?: number;
@@ -48,84 +48,178 @@ export class MessageRoute extends BaseRoute {
 				};
 
 				if (!sessionId || !peer) {
-					return new ErrorResponse("sessionId and peer are required", 400).send(
-						reply,
-					);
+					return new ErrorResponse(
+						"sessionId and peer are required",
+						400,
+					).send(reply);
 				}
 
-				const allMedia: MediaEntry[] = [
+				const hasVisual = photos.length > 0 || videos.length > 0;
+				const hasDocs = files.length > 0;
+
+				// Telegram does not allow mixing visual media (photos/videos) with
+				// documents in the same request. Reject early with a clear message.
+				if (hasVisual && hasDocs) {
+					return new ErrorResponse(
+						"Cannot mix photos/videos with files in the same request. Send them in separate requests.",
+						400,
+					).send(reply);
+				}
+
+				const visualMedia: MediaEntry[] = [
 					...photos.map((url) => ({ url, type: "photo" as const })),
 					...videos.map((url) => ({ url, type: "video" as const })),
-					...files.map((url) => ({ url, type: "file" as const })),
 				];
+				const docMedia: MediaEntry[] = files.map((url) => ({
+					url,
+					type: "file" as const,
+				}));
 
 				try {
-					const result = await this.withTelegramSession(
+					const results = await this.withTelegramSession(
 						sessionId,
 						async (clientService) => {
 							const tc = clientService.getClient();
+							const sent: unknown[] = [];
 
-							if (allMedia.length === 0) {
-								return tc.invoke(
+							const commonFlags = {
+								silent,
+								background,
+								...(scheduleDate && { scheduleDate }),
+								...(replyToMsgId && { replyToMsgId }),
+							};
+
+							// No media at all → plain text message
+							if (visualMedia.length === 0 && docMedia.length === 0) {
+								const r = await tc.invoke(
 									new Api.messages.SendMessage({
 										peer,
 										message,
-										silent,
-										background,
-										...(scheduleDate && { scheduleDate: scheduleDate }),
-										...(replyToMessageId && { replyToMsgId: replyToMessageId }),
+										...commonFlags,
 										randomId: TelegramUtils.randomId(),
 									}),
 								);
+								sent.push(r);
+								return sent;
 							}
 
-							if (allMedia.length === 1) {
-								const media = await TelegramUtils.uploadMedia(
-									tc,
-									allMedia[0].url,
-									allMedia[0].type,
+							/**
+							 * Sends a group of MediaEntry items as a single message or album.
+							 * Caption is placed on the first item of each group.
+							 * Uses messages.UploadMedia to pre-register each file with
+							 * Telegram before building the album — required to avoid MEDIA_INVALID.
+							 */
+							const sendGroup = async (
+								group: MediaEntry[],
+								caption: string,
+							): Promise<void> => {
+								if (group.length === 0) return;
+
+								if (group.length === 1) {
+									const media = await TelegramUtils.uploadMedia(
+										tc,
+										group[0].url,
+										group[0].type,
+									);
+									const r = await tc.invoke(
+										new Api.messages.SendMedia({
+											peer,
+											media,
+											message: caption,
+											...commonFlags,
+											randomId: TelegramUtils.randomId(),
+										}),
+									);
+									sent.push(r);
+									return;
+								}
+
+								// Upload each file and pre-register it with Telegram
+								const uploadedInputMedia = await Promise.all(
+									group.map(({ url, type }) =>
+										TelegramUtils.uploadMedia(tc, url, type),
+									),
 								);
-								return tc.invoke(
-									new Api.messages.SendMedia({
+
+								const registeredMedia = await Promise.all(
+									uploadedInputMedia.map((media: Api.TypeInputMedia) =>
+										tc.invoke(new Api.messages.UploadMedia({ peer, media })),
+									),
+								);
+
+								// Convert MessageMedia → InputMedia for InputSingleMedia
+								const resolvedInputMedia = registeredMedia.map(
+									(m: Api.TypeMessageMedia) => {
+										if (
+											m.className === "MessageMediaPhoto" &&
+											(m as Api.MessageMediaPhoto).photo?.className === "Photo"
+										) {
+											const photo = (m as Api.MessageMediaPhoto)
+												.photo as Api.Photo;
+											return new Api.InputMediaPhoto({
+												id: new Api.InputPhoto({
+													id: photo.id,
+													accessHash: photo.accessHash,
+													fileReference: photo.fileReference,
+												}),
+											});
+										}
+
+										if (
+											m.className === "MessageMediaDocument" &&
+											(m as Api.MessageMediaDocument).document?.className ===
+												"Document"
+										) {
+											const doc = (m as Api.MessageMediaDocument)
+												.document as Api.Document;
+											return new Api.InputMediaDocument({
+												id: new Api.InputDocument({
+													id: doc.id,
+													accessHash: doc.accessHash,
+													fileReference: doc.fileReference,
+												}),
+											});
+										}
+
+										throw new Error(
+											`Unexpected media type from UploadMedia: ${m.className}`,
+										);
+									},
+								);
+
+								// Caption on the first item only
+								const multiMedia = resolvedInputMedia.map(
+									(media: Api.TypeInputMedia, index: number) =>
+										new Api.InputSingleMedia({
+											media,
+											randomId: TelegramUtils.randomId(),
+											message: index === 0 ? caption : "",
+										}),
+								);
+
+								const r = await tc.invoke(
+									new Api.messages.SendMultiMedia({
 										peer,
-										media,
-										message,
-										silent,
-										background,
-										...(scheduleDate && { scheduleDate: scheduleDate }),
-										...(replyToMessageId && { replyToMsgId: replyToMessageId }),
-										randomId: TelegramUtils.randomId(),
+										multiMedia,
+										...commonFlags,
 									}),
 								);
-							}
+								sent.push(r);
+							};
 
-							// Album: upload all files in parallel, caption on first item only
-							const uploadedMedia = await Promise.all(
-								allMedia.map(({ url, type }) =>
-									TelegramUtils.uploadMedia(tc, url, type),
-								),
+							// Send visual media (photos + videos) first, carrying the caption.
+							// Documents are sent as a follow-up group without a repeated caption.
+							await sendGroup(visualMedia, message);
+							await sendGroup(
+								docMedia,
+								visualMedia.length === 0 ? message : "",
 							);
 
-							const multiMedia = uploadedMedia.map(
-								(media: Api.TypeInputMedia, index: number) =>
-									new Api.InputSingleMedia({
-										media,
-										silent,
-										background,
-										randomId: TelegramUtils.randomId(),
-										message: index === 0 ? message : "",
-										...(scheduleDate && { scheduleDate: scheduleDate }),
-										...(replyToMessageId && { replyToMsgId: replyToMessageId }),
-									}),
-							);
-
-							return tc.invoke(
-								new Api.messages.SendMultiMedia({ peer, multiMedia }),
-							);
+							return sent;
 						},
 					);
 
-					new SuccessResponse([result], "Message sent successfully").send(
+					new SuccessResponse(results, "Message sent successfully").send(
 						reply,
 					);
 				} catch (error: unknown) {
@@ -264,7 +358,7 @@ export class MessageRoute extends BaseRoute {
 					revoke = false,
 				} = request.body as {
 					sessionId: string;
-					id: number[];
+					id: string[];
 					revoke?: boolean;
 				};
 
@@ -278,7 +372,7 @@ export class MessageRoute extends BaseRoute {
 					const result = await this.withTelegramSession(sessionId, (client) =>
 						client
 							.getClient()
-							.invoke(new Api.messages.DeleteMessages({ id, revoke })),
+							.invoke(new Api.messages.DeleteMessages({ id: id.map(Number), revoke })),
 					);
 
 					new SuccessResponse([result], "Messages deleted successfully").send(

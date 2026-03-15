@@ -345,9 +345,8 @@ export class ChatRoute extends BaseRoute {
 			async (request: FastifyRequest, reply: FastifyReply) => {
 				const {
 					sessionId,
-					peer,
+					chatId,
 					bannedRights: {
-						untilDate = 0,
 						viewMessages = false,
 						sendMessages = false,
 						sendMedia = false,
@@ -362,9 +361,8 @@ export class ChatRoute extends BaseRoute {
 					} = {},
 				} = request.body as {
 					sessionId: string;
-					peer: string;
+					chatId: string;
 					bannedRights?: {
-						untilDate?: number;
 						viewMessages?: boolean;
 						sendMessages?: boolean;
 						sendMedia?: boolean;
@@ -379,8 +377,8 @@ export class ChatRoute extends BaseRoute {
 					};
 				};
 
-				if (!sessionId || !peer) {
-					return new ErrorResponse("sessionId and peer are required", 400).send(
+				if (!sessionId || !chatId) {
+					return new ErrorResponse("sessionId and chatId are required", 400).send(
 						reply,
 					);
 				}
@@ -389,9 +387,11 @@ export class ChatRoute extends BaseRoute {
 					const result = await this.withTelegramSession(sessionId, (client) =>
 						client.getClient().invoke(
 							new Api.messages.EditChatDefaultBannedRights({
-								peer,
+								peer: new Api.InputPeerChat({ chatId: BigInt(chatId) }),
+								// untilDate is intentionally omitted: Telegram does not support
+								// a time-limited untilDate on group-wide default permissions.
+								// Use channels/EditBanned to set a timed ban on a specific user.
 								bannedRights: new Api.ChatBannedRights({
-									untilDate,
 									viewMessages,
 									sendMessages,
 									sendMedia,
