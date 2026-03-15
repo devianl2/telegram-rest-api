@@ -7,11 +7,15 @@ import { MessageRoute } from "./routes/message/MessageRoute";
 import { ChatRoute } from "./routes/message/ChatRoute";
 import { ChannelRoute } from "./routes/channels/ChannelRoute";
 import { TelegramClientService } from "./telegram/TelegramClientService";
+import { TelegramSessionWatchdog } from "./telegram/TelegramSessionWatchdog";
 
 const PORT = parseInt(process.env.PORT ?? "3000", 10);
 
 async function bootstrap(): Promise<void> {
 	await TelegramClientService.restoreFromDatabase();
+
+	const watchdog = new TelegramSessionWatchdog();
+	watchdog.start();
 
 	const app = new Application();
 	app

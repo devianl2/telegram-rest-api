@@ -103,6 +103,43 @@ export class TelegramClientService implements TelegramClientInterface {
 		return TelegramClientService.pool.has(sessionId);
 	}
 
+	/** Returns the IDs of all sessions currently held in the pool. */
+	static getPooledSessionIds(): string[] {
+		return [...TelegramClientService.pool.keys()];
+	}
+
+	/** Returns the pooled client instance for a session, or undefined. */
+	static getFromPool(sessionId: string): TelegramClientService | undefined {
+		return TelegramClientService.pool.get(sessionId);
+	}
+
+	/**
+	 * Removes a session from the pool and marks it as revoked in the database,
+	 * but does NOT delete the database record.
+	 * Use this when a session is discovered to be logged out externally so that
+	 * the record is preserved for auditing while the live connection is torn down.
+	 */
+	static async evict(sessionId: string): Promise<void> {
+		TelegramClientService.stopMessageHandler(sessionId);
+
+		await DatabaseClient.getInstance().execute((prisma) =>
+			prisma.telegramSession.updateMany({
+				where: { session_id: sessionId },
+				data: { status: SessionStatus.REVOKED },
+			}),
+		);
+
+		const client = TelegramClientService.pool.get(sessionId);
+		if (client) {
+			try {
+				await client.destroy();
+			} catch {
+				// Client may already be in a broken state; ignore destroy errors
+			}
+			TelegramClientService.pool.delete(sessionId);
+		}
+	}
+
 	/**
 	 * Destroys a pooled client, stops its message handler,
 	 * and deletes the session record from the database.
