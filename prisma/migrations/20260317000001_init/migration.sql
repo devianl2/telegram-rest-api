@@ -112,8 +112,7 @@ CREATE UNIQUE INDEX "tenants_secret_id_key" ON "tenants"("secret_id");
 -- CreateIndex
 CREATE UNIQUE INDEX "tenants_secret_code_key" ON "tenants"("secret_code");
 
--- CreateIndex
-CREATE UNIQUE INDEX "tenants_server_name_key" ON "tenants"("server_name");
+CREATE INDEX "tenants_server_name_secret_id_secret_code_idx" ON "tenants"("server_name", "secret_id", "secret_code");
 
 -- CreateIndex
 CREATE INDEX "queue_jobs_status_created_at_idx" ON "queue_jobs"("status", "created_at");

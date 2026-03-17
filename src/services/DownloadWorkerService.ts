@@ -6,10 +6,8 @@ import { Prisma } from "@prisma/client";
 import { DatabaseClient } from "../database/DatabaseClient";
 import { TelegramClientService } from "../telegram/TelegramClientService";
 import { SessionStatus } from "../database/constants/SessionStatus";
-import {
-	RawInput,
-	DownloadTaskRow,
-} from "./interface/DownloadTask";
+import { DownloadTaskStatus } from "../database/constants/DownloadTaskStatus";
+import { RawInput, DownloadTaskRow } from "./interface/DownloadTask";
 
 const MAX_CONCURRENT = parseInt(
 	process.env.MAX_CONCURRENT_DOWNLOADS ?? "5",
@@ -39,9 +37,7 @@ export class DownloadWorkerService {
 
 		this.pollLoop();
 		setInterval(() => this.resetStaleTasks(), STALE_CHECK_INTERVAL_MS);
-		console.log(
-			`[DownloadWorker] Started (max concurrent: ${MAX_CONCURRENT})`,
-		);
+		console.log(`[DownloadWorker] Started (max concurrent: ${MAX_CONCURRENT})`);
 	}
 
 	stop(): void {
@@ -70,22 +66,23 @@ export class DownloadWorkerService {
 	private async claimNextTask(): Promise<DownloadTaskRow | null> {
 		const db = DatabaseClient.getInstance();
 		const workerId = process.pid.toString();
-		const rows = await db.execute<DownloadTaskRow[]>((prisma) =>
-			prisma.$queryRaw`
+		const rows = await db.execute<DownloadTaskRow[]>(
+			(prisma) =>
+				prisma.$queryRaw`
 				UPDATE download_tasks
-				SET status = 'processing',
+				SET status = ${Prisma.raw(`'${DownloadTaskStatus.PROCESSING}'`)},
 				    started_at = NOW(),
 				    worker_id = ${workerId}
 				WHERE id = (
 					SELECT id FROM download_tasks
-					WHERE status = 'pending'
+					WHERE status = ${Prisma.raw(`'${DownloadTaskStatus.PENDING}'`)}
 					AND from_accounts && COALESCE(
 						(
 							SELECT ARRAY_AGG(ts.session_id)
 							FROM telegram_sessions ts
 							JOIN tenants t ON ts.tenant_id = t.id
 							WHERE t.server_name = ${SERVER_NAME}
-							AND ts.status = ${SessionStatus.ACTIVE}
+							AND ts.status = ${Prisma.raw(`'${SessionStatus.ACTIVE}'`)}
 						),
 						ARRAY[]::TEXT[]
 					)
@@ -108,9 +105,7 @@ export class DownloadWorkerService {
 			const rawInput: RawInput = JSON.parse(task.raw_input_json);
 			const client = this.pickClient(task.from_accounts);
 			if (!client) {
-				throw new Error(
-					`No available Telegram client for task ${task.id}`,
-				);
+				throw new Error(`No available Telegram client for task ${task.id}`);
 			}
 
 			const buffer = await this.downloadFile(client, rawInput);
@@ -127,9 +122,7 @@ export class DownloadWorkerService {
 
 			await this.markCompleted(task, filePath, fileUrl);
 
-			console.log(
-				`[DownloadWorker] Completed task ${task.id} → ${fileName}`,
-			);
+			console.log(`[DownloadWorker] Completed task ${task.id} → ${fileName}`);
 		} catch (error) {
 			console.error(
 				`[DownloadWorker] Failed task ${task.id}:`,
@@ -197,7 +190,7 @@ export class DownloadWorkerService {
 				await tx.downloadTask.update({
 					where: { id: task.id },
 					data: {
-						status: "completed",
+						status: DownloadTaskStatus.COMPLETED,
 						file_path: filePath,
 						file_url: fileUrl,
 					},
@@ -215,9 +208,7 @@ export class DownloadWorkerService {
 						data: { file_url: fileUrl },
 					});
 
-					const messageIds = [
-						...new Set(attachments.map((a) => a.message_id)),
-					];
+					const messageIds = [...new Set(attachments.map((a) => a.message_id))];
 
 					for (const msgId of messageIds) {
 						const pendingCount = await tx.attachment.count({
@@ -248,7 +239,10 @@ export class DownloadWorkerService {
 			});
 
 			const retryCount = (current?.retry_count ?? 0) + 1;
-			const newStatus = retryCount >= MAX_RETRIES ? "failed" : "pending";
+			const newStatus =
+				retryCount >= MAX_RETRIES
+					? DownloadTaskStatus.FAILED
+					: DownloadTaskStatus.PENDING;
 
 			await prisma.downloadTask.update({
 				where: { id: task.id },
@@ -286,12 +280,12 @@ export class DownloadWorkerService {
 		await db.execute((prisma) =>
 			prisma.downloadTask.updateMany({
 				where: {
-					status: "processing",
+					status: DownloadTaskStatus.PROCESSING,
 					started_at: { lt: cutoff },
 					from_accounts: { hasSome: sessionIds },
 				},
 				data: {
-					status: "pending",
+					status: DownloadTaskStatus.PENDING,
 					started_at: null,
 					worker_id: null,
 				},
