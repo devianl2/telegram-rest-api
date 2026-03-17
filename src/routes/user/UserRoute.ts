@@ -8,7 +8,6 @@ import { SuccessResponse, ErrorResponse } from "../../http/ApiResponse";
  * The session ID identifies the user and authorises the operation.
  */
 export class UserRoute extends BaseRoute {
-
 	async register(fastify: FastifyInstance): Promise<void> {
 		/**
 		 * Fetches a full user by their ID.
@@ -31,9 +30,9 @@ export class UserRoute extends BaseRoute {
 				}
 
 				try {
-				const result = await this.withTelegramSession(sessionId, (client) =>
-					client.getClient().invoke(new Api.users.GetFullUser({ id })),
-				);
+					const result = await this.withTelegramSession(sessionId, (client) =>
+						client.getClient().invoke(new Api.users.GetFullUser({ id })),
+					);
 
 					new SuccessResponse([result], "User fetched successfully").send(
 						reply,
@@ -65,9 +64,9 @@ export class UserRoute extends BaseRoute {
 				}
 
 				try {
-				const result = await this.withTelegramSession(sessionId, (client) =>
-					client.getClient().invoke(new Api.users.GetUsers({ id })),
-				);
+					const result = await this.withTelegramSession(sessionId, (client) =>
+						client.getClient().invoke(new Api.users.GetUsers({ id })),
+					);
 
 					new SuccessResponse(result, "Users fetched successfully").send(reply);
 				} catch (error: unknown) {
@@ -78,6 +77,7 @@ export class UserRoute extends BaseRoute {
 
 		/**
 		 * Resolves a user by username or phone number. Exactly one of
+		 */
 		fastify.post(
 			"/users/ResolveUser",
 			async (request: FastifyRequest, reply: FastifyReply) => {
@@ -110,14 +110,12 @@ export class UserRoute extends BaseRoute {
 
 				try {
 					if (hasUsername) {
-						const result = await this.withTelegramSession(
-							sessionId,
-							(client) =>
-								client.getClient().invoke(
-									new Api.contacts.ResolveUsername({
-										username: username!.replace(/^@/, ""),
-									}),
-								),
+						const result = await this.withTelegramSession(sessionId, (client) =>
+							client.getClient().invoke(
+								new Api.contacts.ResolveUsername({
+									username: username!.replace(/^@/, ""),
+								}),
+							),
 						);
 						return new SuccessResponse(
 							result,
@@ -131,50 +129,51 @@ export class UserRoute extends BaseRoute {
 						async (client) => {
 							const tg = client.getClient();
 
-						const imported = await tg.invoke(
-							new Api.contacts.ImportContacts({
-								contacts: [
-									new Api.InputPhoneContact({
-										clientId: bigInt(Date.now()),
-										phone: phoneNumber!,
-										firstName: "",
-										lastName: "",
-									}),
-								],
-							}),
-						);
+							const imported = await tg.invoke(
+								new Api.contacts.ImportContacts({
+									contacts: [
+										new Api.InputPhoneContact({
+											clientId: bigInt(Date.now()),
+											phone: phoneNumber!,
+											firstName: "",
+											lastName: "",
+										}),
+									],
+								}),
+							);
 
-						const user = imported.users[0] ?? null;
-						const wasNewlyImported = imported.imported.length > 0;
+							const user = imported.users[0] ?? null;
+							const wasNewlyImported = imported.imported.length > 0;
 
-						// Only delete if we actually added a new contact.
-						// If the contact already existed, leave it untouched.
-						if (wasNewlyImported && user) {
-							try {
-								await tg.invoke(
-									new Api.contacts.DeleteContacts({
-										id: [new Api.InputUser({
-											userId: (user as Api.User).id,
-											accessHash: (user as Api.User).accessHash!,
-										})],
-									}),
-								);
-							} catch {
-								// Non-fatal: log but don't fail the whole request
-								console.warn(
-									`[ResolveUser] Failed to delete temporarily imported contact for phone ${phoneNumber}`,
-								);
+							// Only delete if we actually added a new contact.
+							// If the contact already existed, leave it untouched.
+							if (wasNewlyImported && user) {
+								try {
+									await tg.invoke(
+										new Api.contacts.DeleteContacts({
+											id: [
+												new Api.InputUser({
+													userId: (user as Api.User).id,
+													accessHash: (user as Api.User).accessHash!,
+												}),
+											],
+										}),
+									);
+								} catch {
+									// Non-fatal: log but don't fail the whole request
+									console.warn(
+										`[ResolveUser] Failed to delete temporarily imported contact for phone ${phoneNumber}`,
+									);
+								}
 							}
-						}
 
-						return { user, wasAlreadyContact: !wasNewlyImported };
+							return { user, wasAlreadyContact: !wasNewlyImported };
 						},
 					);
 
-					return new SuccessResponse(
-						result,
-						"User resolved successfully",
-					).send(reply);
+					return new SuccessResponse(result, "User resolved successfully").send(
+						reply,
+					);
 				} catch (error: unknown) {
 					ErrorResponse.fromError(error).send(reply);
 				}

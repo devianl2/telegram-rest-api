@@ -24,15 +24,15 @@ export class IncomingMessageHandler {
 		this.client = client;
 		this.telegramUserId = telegramUserId;
 		this.sessionId = sessionId;
-		this.albumBuffer = new AlbumBuffer(ALBUM_BUFFER_MS, (events) =>
-			this.handleBatch(events),
+		this.albumBuffer = new AlbumBuffer(ALBUM_BUFFER_MS, (messages) =>
+			this.handleBatch(messages),
 		);
 	}
 
 	async start(): Promise<void> {
 		this.handler = async (event: NewMessageEvent) => {
 			try {
-				this.albumBuffer.push(event);
+				this.albumBuffer.push(event.message);
 			} catch (error) {
 				console.error(
 					`[MessageHandler] Error for user ${this.telegramUserId}:`,
@@ -43,15 +43,43 @@ export class IncomingMessageHandler {
 
 		this.client.addEventHandler(
 			this.handler,
-			new NewMessage({ incoming: true }),
+			new NewMessage({
+				incoming: true,
+			}),
 		);
 
+		// Wait for the connection to fully establish before fetching dialogs.
 		await this.delay(IncomingMessageHandler.INIT_DELAY_MS);
 
 		try {
-			await this.client.getDialogs({ limit: 100 });
-		} catch {
-			// Non-fatal — events still work if the session already has update state
+			const dialogs = await this.client.getDialogs({});
+
+			// Force gramjs to fully initialise its per-channel pts by
+			// fetching a recent message from every channel / supergroup.
+			// Without this, megagroups with large pts gaps silently
+			// drop UpdateNewChannelMessage because gramjs cannot
+			// validate the sequence.
+			let synced = 0;
+			for (const dialog of dialogs) {
+				if (dialog.isChannel) {
+					try {
+						await this.client.getMessages(dialog.inputEntity, {
+							limit: 1,
+						});
+						synced++;
+					} catch {
+						// Channel might be restricted or deleted — skip
+					}
+				}
+			}
+			console.log(
+				`[MessageHandler] Synced ${synced} channel(s) for user ${this.telegramUserId}`,
+			);
+		} catch (error) {
+			console.error(
+				`[MessageHandler] Dialog sync error for user ${this.telegramUserId}:`,
+				error,
+			);
 		}
 
 		console.log(`[MessageHandler] Started for user ${this.telegramUserId}`);
@@ -67,17 +95,17 @@ export class IncomingMessageHandler {
 		}
 	}
 
-	private async handleBatch(events: NewMessageEvent[]): Promise<void> {
-		const firstMsg = events[0].message;
-		const chatId = firstMsg.chatId?.toString() ?? "";
-		const messageText = events
-			.map((e) => e.message.text ?? "")
+	private async handleBatch(messages: Api.Message[]): Promise<void> {
+		const firstMsg = messages[0];
+		const chatId = this.extractPeerId(firstMsg.peerId) ?? "";
+		const messageText = messages
+			.map((m) => m.text ?? "")
 			.filter(Boolean)
 			.join("\n");
 
 		const mediaList: ParsedMedia[] = [];
-		for (const event of events) {
-			const parsed = this.extractMedia(event.message);
+		for (const msg of messages) {
+			const parsed = this.extractMedia(msg);
 			if (parsed) mediaList.push(parsed);
 		}
 
@@ -93,7 +121,7 @@ export class IncomingMessageHandler {
 
 		// from_account = actual sender; fall back to chatId for channel posts (no fromId)
 		const fromAccount = this.extractPeerId(firstMsg.fromId) ?? chatId;
-		const rawPayload = this.serializeMessages(events);
+		const rawPayload = this.serializeMessages(messages);
 
 		const db = DatabaseClient.getInstance();
 		await db.execute(async (prisma) => {
@@ -103,11 +131,12 @@ export class IncomingMessageHandler {
 						tenant_id: tenantId,
 						telegram_chat_id: chatId,
 						telegram_message_id: firstMsg.id,
-						from_account: fromAccount,
-						to_account: this.telegramUserId,
-						message: messageText || null,
-						raw_payload: rawPayload,
-						status: hasAttachments ? "pending" : "downloaded",
+					from_account: fromAccount,
+					to_account: this.telegramUserId,
+					message: messageText || null,
+					raw_payload: rawPayload,
+					received_timestamp: firstMsg.date ?? null,
+					status: hasAttachments ? "pending" : "downloaded",
 					},
 				});
 
@@ -238,10 +267,9 @@ export class IncomingMessageHandler {
 		return null;
 	}
 
-	private serializeMessages(events: NewMessageEvent[]): string {
-		return JSON.stringify(
-			events.map((e) => e.message),
-			(_, value) => (typeof value === "bigint" ? value.toString() : value),
+	private serializeMessages(messages: Api.Message[]): string {
+		return JSON.stringify(messages, (_, value) =>
+			typeof value === "bigint" ? value.toString() : value,
 		);
 	}
 

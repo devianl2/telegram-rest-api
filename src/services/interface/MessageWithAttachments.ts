@@ -10,7 +10,9 @@ export interface MessageWithAttachments {
 	telegram_chat_id: string;
 	telegram_message_id: number;
 	from_account: string;
+	to_account: string | null;
 	message: string | null;
+	received_timestamp: number | null;
 	created_at: Date;
 	attachments: AttachmentRecord[];
 }

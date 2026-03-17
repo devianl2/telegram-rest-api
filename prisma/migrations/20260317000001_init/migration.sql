@@ -57,6 +57,7 @@ CREATE TABLE "messages" (
     "to_account" TEXT,
     "message" TEXT,
     "raw_payload" TEXT,
+    "received_timestamp" INTEGER,
     "status" "MessageStatus" NOT NULL DEFAULT 'pending',
     "created_at" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "updated_at" TIMESTAMP(3) NOT NULL,

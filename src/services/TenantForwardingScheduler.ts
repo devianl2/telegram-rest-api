@@ -198,7 +198,9 @@ export class TenantForwardingScheduler {
 			chat_id: msg.telegram_chat_id,
 			message_id: msg.telegram_message_id,
 			from_account: msg.from_account,
+			to_account: msg.to_account,
 			text: msg.message,
+			received_timestamp: msg.received_timestamp,
 			received_at: msg.created_at.toISOString(),
 			attachments: msg.attachments.map((a) => ({
 				file_unique_id: a.file_unique_id,

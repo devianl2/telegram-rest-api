@@ -1,4 +1,4 @@
-import { NewMessageEvent } from "telegram/events";
+import { Api } from "telegram";
 
 export interface ParsedMedia {
 	fileUniqueId: string;
@@ -6,4 +6,4 @@ export interface ParsedMedia {
 	rawInputJson: string;
 }
 
-export type FlushCallback = (events: NewMessageEvent[]) => Promise<void>;
+export type FlushCallback = (messages: Api.Message[]) => Promise<void>;

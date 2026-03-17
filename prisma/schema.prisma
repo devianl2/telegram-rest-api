@@ -83,6 +83,7 @@ model Message {
   to_account          String?       @db.Text
   message             String?       @db.Text
   raw_payload         String?       @db.Text
+  received_timestamp  Int?
   status              MessageStatus @default(pending)
   created_at          DateTime      @default(now())
   updated_at          DateTime      @updatedAt

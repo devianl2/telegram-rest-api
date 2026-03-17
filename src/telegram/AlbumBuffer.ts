@@ -1,16 +1,16 @@
-import { NewMessageEvent } from "telegram/events";
+import { Api } from "telegram";
 import { FlushCallback } from "./interface/MessagePipeline";
 
 /**
- * Collects Telegram events that share a `grouped_id` (albums) and
- * flushes them as a batch after a short debounce window.  Events
+ * Collects Telegram messages that share a `grouped_id` (albums) and
+ * flushes them as a batch after a short debounce window.  Messages
  * without a `grouped_id` are flushed immediately as single-element
  * arrays.
  */
 export class AlbumBuffer {
 	private readonly buffers = new Map<
 		string,
-		{ events: NewMessageEvent[]; timer: NodeJS.Timeout }
+		{ messages: Api.Message[]; timer: NodeJS.Timeout }
 	>();
 
 	constructor(
@@ -18,11 +18,11 @@ export class AlbumBuffer {
 		private readonly onFlush: FlushCallback,
 	) {}
 
-	push(event: NewMessageEvent): void {
-		const groupedId = event.message.groupedId?.toString();
+	push(message: Api.Message): void {
+		const groupedId = message.groupedId?.toString();
 
 		if (!groupedId) {
-			this.onFlush([event]).catch((err) =>
+			this.onFlush([message]).catch((err) =>
 				console.error("[AlbumBuffer] Flush error (single):", err),
 			);
 			return;
@@ -31,9 +31,9 @@ export class AlbumBuffer {
 		const existing = this.buffers.get(groupedId);
 		if (existing) {
 			clearTimeout(existing.timer);
-			existing.events.push(event);
+			existing.messages.push(message);
 		} else {
-			this.buffers.set(groupedId, { events: [event], timer: null! });
+			this.buffers.set(groupedId, { messages: [message], timer: null! });
 		}
 
 		const entry = this.buffers.get(groupedId)!;
@@ -45,7 +45,7 @@ export class AlbumBuffer {
 		if (!entry) return;
 		this.buffers.delete(groupedId);
 
-		this.onFlush(entry.events).catch((err) =>
+		this.onFlush(entry.messages).catch((err) =>
 			console.error("[AlbumBuffer] Flush error (album):", err),
 		);
 	}
