@@ -2,7 +2,8 @@ import { Api, TelegramClient } from "telegram";
 import { StringSession } from "telegram/sessions";
 import { IncomingMessageHandler } from "./IncomingMessageHandler";
 import { IncomingReactionHandler } from "./IncomingReactionHandler";
-import { IncomingModifyHandler } from "./IncomingModifyHandler";
+// import { IncomingChatEventHandler } from "./IncomingChatEventHandler"; // temporarily disabled
+import { IncomingRawDebugHandler } from "./IncomingRawDebugHandler";
 import { DatabaseClient } from "../database/DatabaseClient";
 import { SessionStatus } from "../database/constants/SessionStatus";
 import { TelegramClientInterface } from "./interface/Telegram";
@@ -37,9 +38,9 @@ export class TelegramClientService implements TelegramClientInterface {
 		string,
 		IncomingReactionHandler
 	>();
-	private static readonly modifyHandlers = new Map<
+	private static readonly rawDebugHandlers = new Map<
 		string,
-		IncomingModifyHandler
+		IncomingRawDebugHandler
 	>();
 
 	// ── Instance State ─────────────────────────────────────────────────
@@ -112,7 +113,7 @@ export class TelegramClientService implements TelegramClientInterface {
 				client,
 				telegramUserId,
 			);
-			TelegramClientService.startModifyHandler(
+			TelegramClientService.startRawDebugHandler(
 				sessionId,
 				client,
 				telegramUserId,
@@ -142,7 +143,7 @@ export class TelegramClientService implements TelegramClientInterface {
 	static async invalidate(sessionId: string): Promise<void> {
 		TelegramClientService.stopMessageHandler(sessionId);
 		TelegramClientService.stopReactionHandler(sessionId);
-		TelegramClientService.stopModifyHandler(sessionId);
+		TelegramClientService.stopRawDebugHandler(sessionId);
 
 		// Delete the session record from the database
 		await DatabaseClient.getInstance().execute((prisma) =>
@@ -259,24 +260,24 @@ export class TelegramClientService implements TelegramClientInterface {
 		}
 	}
 
-	private static startModifyHandler(
+	private static startRawDebugHandler(
 		sessionId: string,
 		client: TelegramClientService,
 		telegramUserId: string,
 	): void {
-		const handler = new IncomingModifyHandler(
+		const handler = new IncomingRawDebugHandler(
 			client.getClient(),
 			telegramUserId,
 		);
-		TelegramClientService.modifyHandlers.set(sessionId, handler);
+		TelegramClientService.rawDebugHandlers.set(sessionId, handler);
 		handler.start();
 	}
 
-	private static stopModifyHandler(sessionId: string): void {
-		const handler = TelegramClientService.modifyHandlers.get(sessionId);
+	private static stopRawDebugHandler(sessionId: string): void {
+		const handler = TelegramClientService.rawDebugHandlers.get(sessionId);
 		if (handler) {
 			handler.stop();
-			TelegramClientService.modifyHandlers.delete(sessionId);
+			TelegramClientService.rawDebugHandlers.delete(sessionId);
 		}
 	}
 

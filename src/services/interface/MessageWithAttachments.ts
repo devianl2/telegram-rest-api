@@ -12,6 +12,7 @@ export interface MessageWithAttachments {
 	from_account: string;
 	to_account: string | null;
 	message: string | null;
+	raw_payload: string | null;
 	received_timestamp: number | null;
 	created_at: Date;
 	attachments: AttachmentRecord[];

@@ -192,6 +192,15 @@ export class TenantForwardingScheduler {
 	}
 
 	private writeFinalLog(msg: MessageWithAttachments): void {
+		let rawPayload: unknown = null;
+		if (msg.raw_payload) {
+			try {
+				rawPayload = JSON.parse(msg.raw_payload);
+			} catch {
+				rawPayload = msg.raw_payload;
+			}
+		}
+
 		const payload = {
 			id: msg.id.toString(),
 			tenant_id: msg.tenant_id,
@@ -207,6 +216,7 @@ export class TenantForwardingScheduler {
 				file_type: a.file_type,
 				file_path: a.file_url,
 			})),
+			raw_payload: rawPayload,
 		};
 
 		const logPath = path.join(STORAGE_DIR, `${msg.id}.log`);
