@@ -176,6 +176,8 @@ export class EventHandler {
 				(u) =>
 					u instanceof Api.UpdateNewMessage ||
 					u instanceof Api.UpdateNewChannelMessage ||
+					u instanceof Api.UpdateEditMessage ||
+					u instanceof Api.UpdateEditChannelMessage ||
 					u instanceof Api.UpdateChannel,
 			);
 		}

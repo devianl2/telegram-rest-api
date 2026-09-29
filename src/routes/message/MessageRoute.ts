@@ -745,7 +745,7 @@ export class MessageRoute extends BaseRoute {
 								? await TelegramUtils.uploadMedia(tc, mediaUrl, mediaType!)
 								: undefined;
 
-							return tc.invoke(
+							const editResult = await tc.invoke(
 								new Api.messages.EditMessage({
 									peer: resolvedPeer,
 									id,
@@ -757,6 +757,8 @@ export class MessageRoute extends BaseRoute {
 									...(scheduleDate && { scheduleDate }),
 								}),
 							);
+							await clientService.captureSentResult(editResult, { peer: resolvedPeer });
+							return editResult;
 						},
 					);
 
