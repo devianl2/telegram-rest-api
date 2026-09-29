@@ -113,3 +113,85 @@ describe("outgoing Telegram replies", () => {
 		expect(((updates[0] as Api.UpdateNewChannelMessage).message as Api.Message).replyTo?.replyToMsgId).toBe(9152);
 	});
 });
+
+/**
+ * Telegram never pushes an edit back to the session that made it, so an edit
+ * sent through this API only reaches the editor's own channel if the RPC
+ * response is captured, the same way a send is.
+ */
+describe("outgoing Telegram edits", () => {
+	function editUpdates(edit: Api.TypeUpdate) {
+		return new Api.Updates({ updates: [edit], users: [], chats: [], date: 1785738200, seq: 1 });
+	}
+
+	it("captures the EditMessage response for the editing session", async () => {
+		const app = Fastify();
+		const route = new MessageRoute();
+		const routeWithSession = route as unknown as {
+			withTelegramSession: (
+				sessionId: string,
+				operation: (client: unknown) => Promise<unknown>,
+			) => Promise<unknown>;
+		};
+		const captureSentResult = vi.fn().mockResolvedValue(undefined);
+		const peer = new Api.InputPeerChat({ chatId: bigInt(5409940124) });
+		const response = editUpdates(
+			new Api.UpdateEditMessage({
+				message: new Api.Message({
+					id: 3599,
+					peerId: new Api.PeerChat({ chatId: bigInt(5409940124) }),
+					message: "edited",
+					date: 1785738169,
+					editDate: 1785738200,
+					out: true,
+				}),
+				pts: 1,
+				ptsCount: 1,
+			}),
+		);
+		const client = {
+			getInputEntity: vi.fn().mockResolvedValue(peer),
+			invoke: vi.fn().mockResolvedValue(response),
+		};
+
+		vi.spyOn(routeWithSession, "withTelegramSession").mockImplementation(
+			async (_sessionId, operation) =>
+				operation({ getClient: () => client, captureSentResult } as never),
+		);
+		await route.register(app);
+
+		await app.inject({
+			method: "POST",
+			url: "/messages/EditMessage",
+			payload: { sessionId: "session-1", peer: "5409940124", id: 3599, message: "edited" },
+		});
+
+		expect(captureSentResult).toHaveBeenCalledWith(response, { peer });
+		await app.close();
+	});
+
+	it.each([
+		["basic group", (message: Api.Message) => new Api.UpdateEditMessage({ message, pts: 1, ptsCount: 1 })],
+		["supergroup", (message: Api.Message) => new Api.UpdateEditChannelMessage({ message, pts: 1, ptsCount: 1 })],
+	])("keeps the %s edit update from the response", (_label, buildEdit) => {
+		const handler = new EventHandler({} as never, "7920216818", "session-1");
+		const edit = buildEdit(
+			new Api.Message({
+				id: 3599,
+				peerId: new Api.PeerChat({ chatId: bigInt(5409940124) }),
+				message: "edited",
+				date: 1785738169,
+				editDate: 1785738200,
+				out: true,
+			}),
+		);
+
+		const updates = (
+			handler as unknown as {
+				buildSentUpdates: (result: unknown, context: unknown) => Api.TypeUpdate[];
+			}
+		).buildSentUpdates(editUpdates(edit), {});
+
+		expect(updates).toEqual([edit]);
+	});
+});
