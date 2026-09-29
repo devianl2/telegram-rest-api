@@ -262,6 +262,11 @@ export class EventHandler {
 		parsed.has_media = hasMedia;
 		parsed.media_downloaded = false;
 
+		const readParticipants = await this.resolveReadParticipants(update);
+		if (readParticipants !== null) {
+			parsed.readParticipants = readParticipants;
+		}
+
 		if (mediaList.length > 0) {
 			const urls = await this.downloadMediaInline(mediaList);
 			const allResolved = urls.every((u) => u !== null);
@@ -598,6 +603,52 @@ export class EventHandler {
 				dcId: photo.dcId,
 			}),
 		};
+	}
+
+	/**
+	 * Gets who read our message in a group, since a group read receipt does not
+	 * say who read it. Returns `null` when it is not a group read receipt or the
+	 * list cannot be fetched.
+	 */
+	private async resolveReadParticipants(
+		update: Api.TypeUpdate,
+	): Promise<{ userId: string; date: number }[] | null> {
+		const isHistoryOutbox = update instanceof Api.UpdateReadHistoryOutbox;
+		const isChannelOutbox = update instanceof Api.UpdateReadChannelOutbox;
+		const isDiscussionOutbox =
+			update instanceof Api.UpdateReadChannelDiscussionOutbox;
+		if (!isHistoryOutbox && !isChannelOutbox && !isDiscussionOutbox) return null;
+
+		const msgId = isDiscussionOutbox ? update.readMaxId : update.maxId;
+		if (!msgId) return null;
+
+		let peer: Api.TypeInputPeer;
+		if (isChannelOutbox || isDiscussionOutbox) {
+			const entity = await this.client
+				.getEntity(update.channelId)
+				.catch(() => null);
+			if (!(entity instanceof Api.Channel) || !entity.accessHash) return null;
+			peer = new Api.InputPeerChannel({
+				channelId: entity.id,
+				accessHash: entity.accessHash,
+			});
+		} else {
+			if (update.peer instanceof Api.PeerUser) return null;
+			if (!(update.peer instanceof Api.PeerChat)) return null;
+			peer = new Api.InputPeerChat({ chatId: update.peer.chatId });
+		}
+
+		try {
+			const result = await this.client.invoke(
+				new Api.messages.GetMessageReadParticipants({ peer, msgId }),
+			);
+			return result.map((participant) => ({
+				userId: participant.userId.toString(),
+				date: participant.date,
+			}));
+		} catch {
+			return null;
+		}
 	}
 
 	private extractPeerInfo(peer: Api.TypePeer): {
