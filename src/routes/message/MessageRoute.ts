@@ -645,13 +645,14 @@ export class MessageRoute extends BaseRoute {
 				}
 
 				try {
-					const result = await this.withTelegramSession(sessionId, (client) =>
-						client
+					const deletedIds = id.map(Number);
+					const result = await this.withTelegramSession(sessionId, async (client) => {
+						const affectedMessages = await client
 							.getClient()
-							.invoke(
-								new Api.messages.DeleteMessages({ id: id.map(Number), revoke }),
-							),
-					);
+							.invoke(new Api.messages.DeleteMessages({ id: deletedIds, revoke }));
+						await client.captureSentResult(affectedMessages, { peer: undefined, deletedIds });
+						return affectedMessages;
+					});
 
 					new SuccessResponse(result, "Messages deleted successfully").send(
 						reply,

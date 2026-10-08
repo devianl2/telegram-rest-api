@@ -2,6 +2,7 @@ import bigInt from "big-integer";
 import Fastify from "fastify";
 import { Api } from "teleproto";
 import { describe, expect, it, vi } from "vitest";
+import { ChannelRoute } from "../../src/routes/channels/ChannelRoute";
 import { MessageRoute } from "../../src/routes/message/MessageRoute";
 import { EventHandler } from "../../src/telegram/EventHandler";
 
@@ -193,5 +194,89 @@ describe("outgoing Telegram edits", () => {
 		).buildSentUpdates(editUpdates(edit), {});
 
 		expect(updates).toEqual([edit]);
+	});
+});
+
+/**
+ * Telegram never pushes a delete back to the session that made it, and the
+ * delete RPCs return only AffectedMessages, so the delete update is rebuilt
+ * from the request ids.
+ */
+describe("outgoing Telegram deletes", () => {
+	const affected = new Api.messages.AffectedMessages({ pts: 10, ptsCount: 1 });
+
+	function mockSession(route: unknown, client: unknown, captureSentResult: unknown) {
+		const routeWithSession = route as {
+			withTelegramSession: (
+				sessionId: string,
+				operation: (client: unknown) => Promise<unknown>,
+			) => Promise<unknown>;
+		};
+		vi.spyOn(routeWithSession, "withTelegramSession").mockImplementation(
+			async (_sessionId, operation) =>
+				operation({ getClient: () => client, captureSentResult } as never),
+		);
+	}
+
+	it("captures the messages.DeleteMessages response with the deleted ids", async () => {
+		const app = Fastify();
+		const route = new MessageRoute();
+		const captureSentResult = vi.fn().mockResolvedValue(undefined);
+		mockSession(route, { invoke: vi.fn().mockResolvedValue(affected) }, captureSentResult);
+		await route.register(app);
+
+		await app.inject({
+			method: "POST",
+			url: "/messages/DeleteMessages",
+			payload: { sessionId: "session-1", id: ["9465"], revoke: true },
+		});
+
+		expect(captureSentResult).toHaveBeenCalledWith(affected, { peer: undefined, deletedIds: [9465] });
+		await app.close();
+	});
+
+	it("captures the channels.DeleteMessages response with the channel peer", async () => {
+		const app = Fastify();
+		const route = new ChannelRoute();
+		const captureSentResult = vi.fn().mockResolvedValue(undefined);
+		mockSession(route, { invoke: vi.fn().mockResolvedValue(affected) }, captureSentResult);
+		await route.register(app);
+
+		await app.inject({
+			method: "POST",
+			url: "/channels/DeleteMessages",
+			payload: { sessionId: "session-1", channelId: "1234567890", accessHash: "42", id: [9465] },
+		});
+
+		const [, context] = captureSentResult.mock.calls[0];
+		expect(captureSentResult.mock.calls[0][0]).toBe(affected);
+		expect(context.deletedIds).toEqual([9465]);
+		expect(context.peer).toBeInstanceOf(Api.InputChannel);
+		await app.close();
+	});
+
+	function build(context: unknown) {
+		const handler = new EventHandler({} as never, "7920216818", "session-1");
+		return (
+			handler as unknown as {
+				buildSentUpdates: (result: unknown, context: unknown) => Api.TypeUpdate[];
+			}
+		).buildSentUpdates(affected, context);
+	}
+
+	it("rebuilds UpdateDeleteMessages for a private chat or basic group", () => {
+		const [update] = build({ peer: undefined, deletedIds: [9465] }) as Api.UpdateDeleteMessages[];
+
+		expect(update).toBeInstanceOf(Api.UpdateDeleteMessages);
+		expect(update.messages).toEqual([9465]);
+	});
+
+	it("rebuilds UpdateDeleteChannelMessages for a supergroup or channel", () => {
+		const peer = new Api.InputChannel({ channelId: bigInt(1234567890), accessHash: bigInt(42) });
+		const [update] = build({ peer, deletedIds: [9465] }) as Api.UpdateDeleteChannelMessages[];
+
+		expect(update).toBeInstanceOf(Api.UpdateDeleteChannelMessages);
+		expect(update.channelId.toString()).toBe("1234567890");
+		expect(update.messages).toEqual([9465]);
 	});
 });

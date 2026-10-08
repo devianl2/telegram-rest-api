@@ -333,14 +333,14 @@ export class ChannelRoute extends BaseRoute {
 				}
 
 				try {
-					const result = await this.withTelegramSession(sessionId, (client) =>
-						client.getClient().invoke(
-							new Api.channels.DeleteMessages({
-								channel: this.inputChannel(channelId, accessHash),
-								id,
-							}),
-						),
-					);
+					const result = await this.withTelegramSession(sessionId, async (client) => {
+						const channel = this.inputChannel(channelId, accessHash);
+						const affectedMessages = await client
+							.getClient()
+							.invoke(new Api.channels.DeleteMessages({ channel, id }));
+						await client.captureSentResult(affectedMessages, { peer: channel, deletedIds: id });
+						return affectedMessages;
+					});
 
 					new SuccessResponse(result, "Messages deleted successfully").send(
 						reply,
