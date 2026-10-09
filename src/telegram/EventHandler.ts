@@ -94,6 +94,7 @@ export interface SentMessageContext {
 	message?: string;
 	entities?: Api.TypeMessageEntity[];
 	replyToMessageId?: number;
+	deletedIds?: number[];
 }
 
 export class EventHandler {
@@ -186,6 +187,15 @@ export class EventHandler {
 					u instanceof Api.UpdateEditChannelMessage ||
 					u instanceof Api.UpdateChannel,
 			);
+		}
+
+		if (result instanceof Api.messages.AffectedMessages && context.deletedIds) {
+			const deleted = { messages: context.deletedIds, pts: result.pts, ptsCount: result.ptsCount };
+			return [
+				context.peer instanceof Api.InputChannel
+					? new Api.UpdateDeleteChannelMessages({ channelId: context.peer.channelId, ...deleted })
+					: new Api.UpdateDeleteMessages(deleted),
+			];
 		}
 
 		if (result instanceof Api.UpdateShortSentMessage) {
