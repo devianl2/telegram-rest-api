@@ -37,6 +37,8 @@ const ENTITY_FACTORIES: Record<
 		}),
 	spoiler: (e) =>
 		new Api.MessageEntitySpoiler({ offset: e.offset, length: e.length }),
+	blockquote: (e) =>
+		new Api.MessageEntityBlockquote({ offset: e.offset, length: e.length }),
 	textUrl: (e) => {
 		if (!e.url) return null;
 		return new Api.MessageEntityTextUrl({
