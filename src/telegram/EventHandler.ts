@@ -2,6 +2,7 @@ import { Api, TelegramClient } from "teleproto";
 import { Raw } from "teleproto/events";
 import { UpdateConnectionState } from "teleproto/network";
 import bigInt from "big-integer";
+import { createHash } from "node:crypto";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
@@ -101,6 +102,7 @@ export class EventHandler {
 	private readonly client: TelegramClient;
 	private readonly telegramUserId: string;
 	private readonly sessionId: string;
+	private readonly sessionHash: string;
 
 	private rawHandler: ((update: Api.TypeUpdate) => void) | null = null;
 
@@ -112,6 +114,7 @@ export class EventHandler {
 		this.client = client;
 		this.telegramUserId = telegramUserId;
 		this.sessionId = sessionId;
+		this.sessionHash = createHash("sha256").update(sessionId, "utf8").digest("hex");
 	}
 
 	async start(): Promise<void> {
@@ -276,6 +279,9 @@ export class EventHandler {
 			userId: sessionRecord.telegram_user_id,
 			className: "PeerUser",
 		};
+		// The session string is the MTProto auth key, so only its hash leaves the
+		// gateway; the consumer routes by matching sha256(channels.token).
+		parsed.sessionHash = this.sessionHash;
 		parsed.isOutgoingMessage = isOutgoing;
 		parsed.has_media = hasMedia;
 		parsed.media_downloaded = false;

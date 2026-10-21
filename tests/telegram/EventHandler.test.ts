@@ -1,9 +1,12 @@
 import bigInt from "big-integer";
 import Fastify from "fastify";
+import { createHash } from "node:crypto";
 import { Api } from "teleproto";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { ChannelRoute } from "../../src/routes/channels/ChannelRoute";
 import { MessageRoute } from "../../src/routes/message/MessageRoute";
+import { DatabaseClient } from "../../src/database/DatabaseClient";
+import { DeliveryDispatcher } from "../../src/services/DeliveryDispatcher";
 import { EventHandler } from "../../src/telegram/EventHandler";
 
 describe("outgoing Telegram replies", () => {
@@ -278,5 +281,67 @@ describe("outgoing Telegram deletes", () => {
 		expect(update).toBeInstanceOf(Api.UpdateDeleteChannelMessages);
 		expect(update.channelId.toString()).toBe("1234567890");
 		expect(update.messages).toEqual([9465]);
+	});
+});
+
+describe("forwarded update payload", () => {
+	function stubPersistence() {
+		const inserted: { raw_payload: string }[] = [];
+		const d = {
+			select: () => ({
+				from: () => ({
+					where: () => ({
+						limit: () => [{ id: 7n, telegram_user_id: "7920216818" }],
+					}),
+				}),
+			}),
+			insert: () => ({
+				values: (row: { raw_payload: string }) => {
+					inserted.push(row);
+				},
+			}),
+		};
+		vi.spyOn(DatabaseClient, "getInstance").mockReturnValue({
+			execute: async (fn: (db: unknown) => unknown) => fn(d),
+		} as never);
+		vi.spyOn(DeliveryDispatcher, "wake").mockImplementation(() => undefined);
+		return inserted;
+	}
+
+	const sessionString =
+		"1BQANOTEuMTA4LjU2LjE1MgG7Ae4qk2Xr0vYwF9pLz3mHcQ8sJtNbKdWuVyEaRgTiOhPnMfCxZlBj5o7D1e6S2r4U0w9q8YkAv3hGxLsNpQmIcRtJbFuWyEzKdVa" +
+		"Hg2Oi4Pn6Mf8Cx0Zl1Bj3o5D7e9S1r3U5w7q9YkAv1hGxLsNpQmIcRtJbFuWyEzKdVaHg2Oi4Pn6Mf8Cx0Zl1Bj3o5D7e9S1r3U5w7q9Yk=";
+	const sessionHash = createHash("sha256").update(sessionString, "utf8").digest("hex");
+
+	afterEach(() => vi.restoreAllMocks());
+
+	it("stamps the receiving session hash on a realtime update", async () => {
+		const inserted = stubPersistence();
+		const handler = new EventHandler({} as never, "7920216818", sessionString);
+
+		(handler as unknown as { handleRawUpdate: (u: Api.TypeUpdate) => void }).handleRawUpdate(
+			new Api.UpdateDeleteMessages({ messages: [9465], pts: 1, ptsCount: 1 }),
+		);
+
+		await vi.waitFor(() => expect(inserted).toHaveLength(1));
+		const payload = JSON.parse(inserted[0].raw_payload);
+		expect(payload.sessionHash).toBe(sessionHash);
+		expect(payload).not.toHaveProperty("sessionId");
+		expect(inserted[0].raw_payload).not.toContain(sessionString);
+		expect(payload.receiverId).toEqual({ userId: "7920216818", className: "PeerUser" });
+	});
+
+	it("stamps the sending session hash on a captured sent message", async () => {
+		const inserted = stubPersistence();
+		const handler = new EventHandler({} as never, "7920216818", sessionString);
+
+		await handler.captureSentResult(
+			new Api.UpdateShortSentMessage({ id: 3599, pts: 1, ptsCount: 1, date: 1785738169, out: true }),
+			{ peer: new Api.InputPeerChat({ chatId: bigInt(5409940124) }), message: "hi" },
+		);
+
+		expect(inserted).toHaveLength(1);
+		expect(JSON.parse(inserted[0].raw_payload).sessionHash).toBe(sessionHash);
+		expect(inserted[0].raw_payload).not.toContain(sessionString);
 	});
 });
