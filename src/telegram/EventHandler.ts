@@ -56,6 +56,8 @@ interface RawInputPhoto {
 	accessHash: string;
 	fileReference: string;
 	thumbSize: string;
+	/** Set when the photo has only inline sizes; getFile cannot serve those. */
+	inlineJpegBase64?: string;
 	dcId: number;
 	messageId: number;
 	peerId: string;
@@ -323,8 +325,8 @@ export class EventHandler {
 	): Promise<(string | null)[]> {
 		return Promise.all(
 			mediaList.map(async (media) => {
+				const rawInput: RawInput = JSON.parse(media.rawInputJson);
 				try {
-					const rawInput: RawInput = JSON.parse(media.rawInputJson);
 					const buffer = await this.downloadFile(rawInput);
 					if (!buffer || buffer.length === 0) return null;
 					return await this.uploadFile(
@@ -333,8 +335,10 @@ export class EventHandler {
 						rawInput,
 					);
 				} catch (err) {
+					const sizeNote =
+						rawInput.type === "photo" ? ` (thumbSize ${rawInput.thumbSize})` : "";
 					console.error(
-						`[EventHandler] Inline download failed for ${media.fileUniqueId}:`,
+						`[EventHandler] Inline download failed for ${media.fileUniqueId}${sizeNote}:`,
 						err instanceof Error ? err.message : err,
 					);
 					return null;
@@ -370,11 +374,15 @@ export class EventHandler {
 			return this.toBuffer(result);
 		}
 
+		if (rawInput.inlineJpegBase64) {
+			return Buffer.from(rawInput.inlineJpegBase64, "base64");
+		}
+
 		const location = new Api.InputPhotoFileLocation({
 			id: bigInt(rawInput.id),
 			accessHash: bigInt(rawInput.accessHash),
 			fileReference: Buffer.from(rawInput.fileReference, "base64"),
-			thumbSize: rawInput.thumbSize || "x",
+			thumbSize: rawInput.thumbSize,
 		});
 		const result = await this.client.downloadFile(location, {
 			dcId: rawInput.dcId,
@@ -557,9 +565,8 @@ export class EventHandler {
 		) {
 			const { peerId, peerType } = this.extractPeerInfo(msg.peerId);
 			const { photo } = media;
-			const bestSize = photo.sizes[photo.sizes.length - 1];
-			const thumbType =
-				"type" in bestSize ? (bestSize as Api.PhotoSize).type : "x";
+			const size = TelegramUtils.pickPhotoSize(photo);
+			if (!size) return null;
 
 			return {
 				fileUniqueId: `photo_${photo.id.toString()}`,
@@ -569,7 +576,9 @@ export class EventHandler {
 					id: photo.id.toString(),
 					accessHash: photo.accessHash.toString(),
 					fileReference: Buffer.from(photo.fileReference).toString("base64"),
-					thumbSize: thumbType,
+					thumbSize: size.type,
+					inlineJpegBase64:
+						size.kind === "inline" ? size.jpeg.toString("base64") : undefined,
 					dcId: photo.dcId,
 					messageId: msg.id,
 					peerId,

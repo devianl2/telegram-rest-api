@@ -46,19 +46,30 @@ async function downloadAndUploadToS3(
 			return [{ file_unique_id: fileUniqueId, file_type: "photo", url: existingUrl }];
 		}
 
-		const bestSize = photo.sizes[photo.sizes.length - 1];
-		const thumbType =
-			"type" in bestSize ? (bestSize as Api.PhotoSize).type : "y";
-		const location = new Api.InputPhotoFileLocation({
-			id: photo.id,
-			accessHash: photo.accessHash,
-			fileReference: photo.fileReference,
-			thumbSize: thumbType,
-		});
-		const result = await client.downloadFile(location, {
-			dcId: photo.dcId,
-		});
-		const buffer = toBuffer(result);
+		const size = TelegramUtils.pickPhotoSize(photo);
+		if (!size) return [];
+
+		let buffer: Buffer;
+		if (size.kind === "inline") {
+			buffer = size.jpeg;
+		} else {
+			const location = new Api.InputPhotoFileLocation({
+				id: photo.id,
+				accessHash: photo.accessHash,
+				fileReference: photo.fileReference,
+				thumbSize: size.type,
+			});
+			try {
+				buffer = toBuffer(await client.downloadFile(location, { dcId: photo.dcId }));
+			} catch (err) {
+				// Prefixed, not wrapped: withTelegramSession and ErrorResponse read
+				// `code` / `errorMessage` off the original Telegram error.
+				if (err instanceof Error) {
+					err.message = `photo ${photo.id} thumbSize ${size.type}: ${err.message}`;
+				}
+				throw err;
+			}
+		}
 		if (buffer.length === 0) return [];
 
 		const url = await S3UploadService.upload(buffer, fileName, "image/jpeg", subPath);
