@@ -8,6 +8,7 @@ import { MessageRoute } from "../../src/routes/message/MessageRoute";
 import { DatabaseClient } from "../../src/database/DatabaseClient";
 import { DeliveryDispatcher } from "../../src/services/DeliveryDispatcher";
 import { EventHandler } from "../../src/telegram/EventHandler";
+import { S3UploadService } from "../../src/services/S3UploadService";
 
 describe("outgoing Telegram replies", () => {
 	it("forwards a text reply target into sent-message reconstruction", async () => {
@@ -343,5 +344,124 @@ describe("forwarded update payload", () => {
 		expect(inserted).toHaveLength(1);
 		expect(JSON.parse(inserted[0].raw_payload).sessionHash).toBe(sessionHash);
 		expect(inserted[0].raw_payload).not.toContain(sessionString);
+	});
+});
+
+/**
+ * A small photo lists [m, stripped i]; getFile with the trailing "i" fails, so
+ * ingest and DownloadAttachments must both ask for "m".
+ */
+describe("small photo download", () => {
+	afterEach(() => {
+		vi.restoreAllMocks();
+	});
+
+	const smallPhoto = () =>
+		new Api.Photo({
+			id: bigInt(6170),
+			accessHash: bigInt(42),
+			fileReference: Buffer.from([7]),
+			date: 1785738169,
+			sizes: [
+				new Api.PhotoSize({ type: "m", w: 85, h: 79, size: 2883 }),
+				new Api.PhotoStrippedSize({ type: "i", bytes: Buffer.from([1, 40, 37, 0xaa]) }),
+			],
+			dcId: 5,
+		});
+	const photoMessage = (photo: Api.Photo) =>
+		new Api.Message({
+			id: 9200,
+			peerId: new Api.PeerUser({ userId: bigInt(5409940124) }),
+			message: "",
+			date: 1785738169,
+			media: new Api.MessageMediaPhoto({ photo }),
+		});
+
+	type HandlerInternals = {
+		extractMediaFromUpdate: (update: unknown, all: boolean) => Array<{ rawInputJson: string }>;
+		downloadFile: (rawInput: unknown) => Promise<Buffer>;
+	};
+
+	it("ingests the real size and downloads it with that thumbSize", async () => {
+		const client = { downloadFile: vi.fn().mockResolvedValue(Buffer.from([0xff, 0xd8])) };
+		const handler = new EventHandler(client as never, "7920216818", "session-1") as unknown as HandlerInternals;
+		const update = new Api.UpdateNewMessage({ message: photoMessage(smallPhoto()), pts: 1, ptsCount: 1 });
+
+		const [media] = handler.extractMediaFromUpdate(update, false);
+		const rawInput = JSON.parse(media.rawInputJson);
+		await handler.downloadFile(rawInput);
+
+		expect(rawInput.thumbSize).toBe("m");
+		expect(rawInput.inlineJpegBase64).toBeUndefined();
+		const [location] = client.downloadFile.mock.calls[0];
+		expect(location).toBeInstanceOf(Api.InputPhotoFileLocation);
+		expect(location.thumbSize).toBe("m");
+	});
+
+	it("serves an inline-only photo from rawInput without calling Telegram", async () => {
+		const client = { downloadFile: vi.fn() };
+		const handler = new EventHandler(client as never, "7920216818", "session-1") as unknown as HandlerInternals;
+		const photo = smallPhoto();
+		photo.sizes = [photo.sizes[1]];
+		const update = new Api.UpdateNewMessage({ message: photoMessage(photo), pts: 1, ptsCount: 1 });
+
+		const [media] = handler.extractMediaFromUpdate(update, false);
+		const buffer = await handler.downloadFile(JSON.parse(media.rawInputJson));
+
+		expect(client.downloadFile).not.toHaveBeenCalled();
+		expect([...buffer.subarray(0, 2)]).toEqual([0xff, 0xd8]);
+	});
+
+	async function downloadAttachments(downloadFile: ReturnType<typeof vi.fn>) {
+		const app = Fastify();
+		const route = new MessageRoute();
+		const routeWithSession = route as unknown as {
+			withTelegramSession: (
+				sessionId: string,
+				operation: (client: unknown) => Promise<unknown>,
+			) => Promise<unknown>;
+		};
+		const client = {
+			getInputEntity: vi.fn().mockResolvedValue(new Api.InputPeerUser({ userId: bigInt(5409940124), accessHash: bigInt(1) })),
+			invoke: vi.fn().mockResolvedValue(
+				new Api.messages.Messages({ messages: [photoMessage(smallPhoto())], chats: [], users: [], topics: [] }),
+			),
+			downloadFile,
+		};
+		vi.spyOn(routeWithSession, "withTelegramSession").mockImplementation(
+			async (_sessionId, operation) => operation({ getClient: () => client } as never),
+		);
+		vi.spyOn(S3UploadService, "isConfigured").mockReturnValue(true);
+		vi.spyOn(S3UploadService, "exists").mockResolvedValue(null);
+		const upload = vi.spyOn(S3UploadService, "upload").mockResolvedValue("https://s3.test/photo.jpg");
+		await route.register(app);
+
+		const response = await app.inject({
+			method: "POST",
+			url: "/messages/DownloadAttachments",
+			payload: { sessionId: "session-1", peer: "5409940124", messageIds: [9200] },
+		});
+		await app.close();
+		return { response, upload };
+	}
+
+	it("DownloadAttachments fetches the real size", async () => {
+		const downloadFile = vi.fn().mockResolvedValue(Buffer.from([0xff, 0xd8]));
+
+		const { response, upload } = await downloadAttachments(downloadFile);
+
+		expect(response.statusCode).toBe(200);
+		expect(downloadFile.mock.calls[0][0].thumbSize).toBe("m");
+		expect(upload).toHaveBeenCalledOnce();
+	});
+
+	it("DownloadAttachments reports the thumbSize it tried and keeps the Telegram code", async () => {
+		const rpcError = Object.assign(new Error("FILE_REFERENCE_EXPIRED"), { code: 400 });
+		const downloadFile = vi.fn().mockRejectedValue(rpcError);
+
+		const { response } = await downloadAttachments(downloadFile);
+
+		expect(response.statusCode).toBe(400);
+		expect(response.json().message).toBe("photo 6170 thumbSize m: FILE_REFERENCE_EXPIRED");
 	});
 });

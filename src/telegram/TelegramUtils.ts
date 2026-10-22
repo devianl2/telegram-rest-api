@@ -1,9 +1,28 @@
 import { Api, TelegramClient, utils } from "teleproto";
 import { CustomFile } from "teleproto/client/uploads";
+import { strippedPhotoToJpg } from "teleproto/Utils";
 import bigInt from "big-integer";
 import mime from "mime-types";
 
 export type MediaType = "photo" | "video" | "file" | "voice";
+
+/**
+ * `remote` sizes are fetched with `upload.getFile` using `type` as the
+ * thumbSize; `inline` sizes have no remote copy, so their bytes ship here.
+ */
+export type PhotoSizePick =
+	| { kind: "remote"; type: string }
+	| { kind: "inline"; type: string; jpeg: Buffer };
+
+function largestByArea<T extends { w: number; h: number }>(
+	sizes: T[],
+): T | undefined {
+	return sizes.reduce<T | undefined>(
+		(best, size) =>
+			!best || size.w * size.h >= best.w * best.h ? size : best,
+		undefined,
+	);
+}
 
 export interface RawMessageEntity {
 	type: string;
@@ -212,6 +231,46 @@ export class TelegramUtils {
 		return bigInt(Date.now())
 			.multiply(bigInt(1_000))
 			.plus(bigInt(Math.floor(Math.random() * 1_000)));
+	}
+
+	/**
+	 * Picks the largest size `upload.getFile` can serve, falling back to the
+	 * largest inline thumbnail. Telegram lists the stripped thumbnail last on
+	 * small photos and first on large ones, and getFile cannot serve inline
+	 * sizes (it answers FILE_REFERENCE_EXPIRED), so the last entry is unsafe.
+	 */
+	static pickPhotoSize(photo: Api.Photo): PhotoSizePick | null {
+		const remote = largestByArea(
+			photo.sizes.filter(
+				(s): s is Api.PhotoSize | Api.PhotoSizeProgressive =>
+					s instanceof Api.PhotoSize || s instanceof Api.PhotoSizeProgressive,
+			),
+		);
+		if (remote) return { kind: "remote", type: remote.type };
+
+		// A cached size is a full JPEG at real dimensions; a stripped one is a
+		// low-resolution blur preview, so it is the last resort.
+		const cached = largestByArea(
+			photo.sizes.filter(
+				(s): s is Api.PhotoCachedSize => s instanceof Api.PhotoCachedSize,
+			),
+		);
+		if (cached) {
+			return { kind: "inline", type: cached.type, jpeg: Buffer.from(cached.bytes) };
+		}
+
+		const stripped = photo.sizes.find(
+			(s): s is Api.PhotoStrippedSize => s instanceof Api.PhotoStrippedSize,
+		);
+		if (stripped) {
+			return {
+				kind: "inline",
+				type: stripped.type,
+				jpeg: strippedPhotoToJpg(Buffer.from(stripped.bytes)),
+			};
+		}
+
+		return null;
 	}
 
 	/**
