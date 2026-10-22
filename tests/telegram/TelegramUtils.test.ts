@@ -63,3 +63,17 @@ describe("TelegramUtils.uploadMedia", () => {
 		).toBe("doc.pdf");
 	});
 });
+
+describe("TelegramUtils.buildEntities", () => {
+	it("maps a blockquote entry to MessageEntityBlockquote", async () => {
+		const entities = await TelegramUtils.buildEntities([
+			{ type: "blockquote", offset: 3, length: 5 },
+		]);
+
+		expect(entities).toHaveLength(1);
+		const blockquote = entities![0] as Api.MessageEntityBlockquote;
+		expect(blockquote).toBeInstanceOf(Api.MessageEntityBlockquote);
+		expect(blockquote.offset).toBe(3);
+		expect(blockquote.length).toBe(5);
+	});
+});
