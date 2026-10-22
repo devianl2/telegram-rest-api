@@ -945,6 +945,66 @@ export class ChannelRoute extends BaseRoute {
 		);
 
 		/**
+		 * Returns the most recent participants (up to 200, single call, no paging)
+		 * of a channel or supergroup as the raw Telegram result.
+		 */
+		fastify.post(
+			"/channels/GetParticipants",
+			async (request: FastifyRequest, reply: FastifyReply) => {
+				const { sessionId, channelId, accessHash } = request.body as {
+					sessionId: string;
+					channelId: string;
+					accessHash?: string;
+				};
+
+				if (!sessionId || !channelId) {
+					return new ErrorResponse(
+						"sessionId and channelId are required",
+						400,
+					).send(reply);
+				}
+
+				try {
+					const result = await this.withTelegramSession(
+						sessionId,
+						async (client) => {
+							const tgClient = client.getClient();
+
+							const resolvedHash = await this.resolveChannelAccessHash(
+								tgClient,
+								channelId,
+								accessHash,
+							);
+
+							const participantsResult = await tgClient.invoke(
+								new Api.channels.GetParticipants({
+									channel: this.inputChannel(channelId, resolvedHash),
+									filter: new Api.ChannelParticipantsRecent(),
+									offset: 0,
+									limit: 200,
+									hash: bigInt.zero,
+								}),
+							);
+
+							return JSON.parse(
+								JSON.stringify(participantsResult, (_, v) =>
+									typeof v === "bigint" ? v.toString() : v,
+								),
+							);
+						},
+					);
+
+					new SuccessResponse(
+						result,
+						"Participants fetched successfully",
+					).send(reply);
+				} catch (error: unknown) {
+					ErrorResponse.fromError(error).send(reply);
+				}
+			},
+		);
+
+		/**
 		 * Returns all supergroups that can be used as a discussion group
 		 * linked to a broadcast channel.
 		 */
