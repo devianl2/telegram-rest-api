@@ -9,6 +9,7 @@ import {
 	RawMessageEntity,
 } from "../../telegram/TelegramUtils";
 import { S3UploadService } from "../../services/S3UploadService";
+import { toBrowserPlayableAudio } from "../../services/AudioTranscode";
 
 interface MediaEntry {
 	url: string;
@@ -106,7 +107,10 @@ async function downloadAndUploadToS3(
 		const buffer = toBuffer(result);
 		if (buffer.length === 0) return [];
 
-		const url = await S3UploadService.upload(buffer, fileName, doc.mimeType ?? undefined, subPath);
+		const playable = fileType === "audio" ? await toBrowserPlayableAudio(buffer) : null;
+		const url = playable
+			? await S3UploadService.upload(playable, fileName, "audio/mp4", subPath)
+			: await S3UploadService.upload(buffer, fileName, doc.mimeType ?? undefined, subPath);
 		return [{ file_unique_id: fileUniqueId, file_type: fileType, url }];
 	}
 
