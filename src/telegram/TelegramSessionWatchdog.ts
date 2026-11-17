@@ -21,13 +21,18 @@ interface TelegramSessionRecord {
  * Periodically scans the session pool and the database to keep live
  * Telegram connections in a healthy state.
  *
- * Two scenarios are handled on every tick:
+ * Three scenarios are handled on every tick:
  *
  * 1. **Stale pool entry** — a session is pooled but the user has logged out
  *    (e.g. revoked from another device). The client is destroyed, removed from
  *    the pool, and the database record is marked as revoked.
  *
- * 2. **Dead session** — a session is active in the database but absent from
+ * 2. **Stalled session** — a session is pooled and authorized, but its update
+ *    position stays behind the server for several minutes. It is disconnected
+ *    so the owner can reconnect, unless most of the pool is behind, which
+ *    points to a Telegram issue rather than to one session.
+ *
+ * 3. **Dead session** — a session is active in the database but absent from
  *    the pool (e.g. the process crashed and restarted without a full restore,
  *    or the connection dropped silently). The session is re-initialized and
  *    added back to the pool automatically.
@@ -35,7 +40,12 @@ interface TelegramSessionRecord {
  * The check interval is controlled by `WATCHDOG_INTERVAL_SECONDS` in the
  * environment file (default: 60 seconds).
  */
-const REVOKE_AFTER_FAILURES = 10;
+const REVOKE_AFTER_FAILING_MS = 3 * 60_000;
+const REVOKE_AFTER_FAILED_CHECKS = 3;
+
+const STALL_CONFIRM_MS = 5 * 60_000;
+const TICK_OVERRUN_LOG_INTERVAL_MS = 5 * 60_000;
+const REPEATED_LOG_INTERVAL_MS = 10 * 60_000;
 
 /**
  * Upper bound for a single authorization probe. A hung probe would otherwise
@@ -58,14 +68,41 @@ const CREDENTIAL_RETRY_DELAY_MS = 5_000;
 /** Result of a single authorization probe. */
 type ProbeOutcome = "authorized" | "credential_error" | "transient_error";
 
+interface SessionInfo {
+	callback_url: string;
+	telegram_user_id: string;
+}
+
 export class TelegramSessionWatchdog {
 	private timer: ReturnType<typeof setInterval> | null = null;
 
 	/** Whether a health-check tick is currently in progress. */
 	private busy = false;
 
-	/** Tracks consecutive authorization-probe failures per session. */
-	private readonly failureCounts = new Map<string, number>();
+	private tickStartedAt = 0;
+
+	private readonly serverPositions = new Map<string, number>();
+
+	private readonly stallTrackers = new Map<
+		string,
+		{ localPosition: number; stalledSince: number }
+	>();
+
+	private readonly lastLoggedAt = new Map<string, number>();
+
+	/**
+	 * Tracks the current run of authorization-probe failures per session: the
+	 * time it failed alone, how many checks failed, and when the last counted
+	 * check ran (absent while the run is paused by a network outage).
+	 */
+	private readonly failureRuns = new Map<
+		string,
+		{
+			failingMilliseconds: number;
+			failedChecks: number;
+			lastCountedAt: number | undefined;
+		}
+	>();
 
 	/** Last lifecycle reason emitted per session, used to avoid callback spam. */
 	private readonly lastEmittedReason = new Map<string, SessionLifecycleReason>();
@@ -109,12 +146,24 @@ export class TelegramSessionWatchdog {
 	 */
 	private async tick(): Promise<void> {
 		if (this.busy) {
+			const runningMs = Date.now() - this.tickStartedAt;
+			if (runningMs >= TICK_OVERRUN_LOG_INTERVAL_MS) {
+				this.logAtMostEvery(
+					"tick-overrun",
+					TICK_OVERRUN_LOG_INTERVAL_MS,
+					"error",
+					`[Watchdog] Tick still running after ${Math.round(runningMs / 1000)}s`,
+				);
+			}
 			return;
 		}
 
 		this.busy = true;
+		this.tickStartedAt = Date.now();
+		this.serverPositions.clear();
 		try {
 			await this.evictLoggedOutSessions();
+			await this.disconnectStalledSessions();
 			await this.reviveDeadSessions();
 		} finally {
 			this.busy = false;
@@ -138,13 +187,16 @@ export class TelegramSessionWatchdog {
 	 * in the caller.
 	 */
 	private async probeSession(
+		sessionId: string,
 		client: TelegramClientService,
 	): Promise<ProbeOutcome> {
 		try {
-			await this.withTimeout(
+			const state = await TelegramUtils.withTimeout(
 				client.getClient().invoke(new Api.updates.GetState()),
 				PROBE_TIMEOUT_MS,
+				"authorization probe timed out",
 			);
+			this.serverPositions.set(sessionId, state.pts);
 			return "authorized";
 		} catch (error) {
 			return TelegramUtils.isCredentialError(error)
@@ -160,12 +212,13 @@ export class TelegramSessionWatchdog {
 	 * The returned outcome is the last probe's result.
 	 */
 	private async reprobeWithRetries(
+		sessionId: string,
 		client: TelegramClientService,
 	): Promise<ProbeOutcome> {
 		let outcome: ProbeOutcome = "credential_error";
 		for (let retry = 1; retry <= CREDENTIAL_MAX_RETRIES; retry++) {
 			await this.sleep(CREDENTIAL_RETRY_DELAY_MS);
-			outcome = await this.probeSession(client);
+			outcome = await this.probeSession(sessionId, client);
 			if (outcome === "authorized") break;
 		}
 		return outcome;
@@ -176,32 +229,21 @@ export class TelegramSessionWatchdog {
 		return new Promise((resolve) => setTimeout(resolve, ms));
 	}
 
-	/** Rejects with a timeout error if `promise` does not settle within `ms`. */
-	private withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
-		let timer!: ReturnType<typeof setTimeout>;
-		const timeout = new Promise<never>((_, reject) => {
-			timer = setTimeout(
-				() => reject(new Error("authorization probe timed out")),
-				ms,
-			);
-		});
-		return Promise.race([promise, timeout]).finally(() =>
-			clearTimeout(timer),
-		);
-	}
-
 	/**
 	 * Scenario 1: Pool contains a session whose user has logged out.
 	 *
 	 * First probes every pooled session with `isUserAuthorized()`, then
 	 * applies a circuit breaker: if most sessions failed in this tick
 	 * the cause is almost certainly a network outage rather than
-	 * individual logouts, so failure counters are left unchanged and
-	 * no sessions are evicted.
+	 * individual logouts, so the failure runs of the failing sessions are
+	 * paused (the outage counts toward neither time nor checks, what was
+	 * counted before is kept), the run of a session that passed is cleared,
+	 * and no sessions are evicted.
 	 *
-	 * Individual failures are tracked with a consecutive-failure counter;
-	 * a session is only revoked after {@link REVOKE_AFTER_FAILURES}
-	 * consecutive ticks where it alone (not the whole pool) fails.
+	 * Individual failures are tracked as a run of failed checks; a session is
+	 * only revoked once the run has failed for {@link REVOKE_AFTER_FAILING_MS}
+	 * and holds at least {@link REVOKE_AFTER_FAILED_CHECKS} checks where it
+	 * alone (not the whole pool) fails.
 	 */
 	private async evictLoggedOutSessions(): Promise<void> {
 		const pooledIds = TelegramClientService.getPooledSessionIds();
@@ -217,14 +259,14 @@ export class TelegramSessionWatchdog {
 				const client = TelegramClientService.getFromPool(sessionId);
 				if (!client) return;
 
-				results.set(sessionId, await this.probeSession(client));
+				results.set(sessionId, await this.probeSession(sessionId, client));
 			}),
 		);
 
 		// Credential errors are a definitive verdict from Telegram (the network
 		// round-trip itself succeeded), so they are exempt from the
-		// network-outage circuit breaker and the slow consecutive-failure
-		// counter below. Confirm with a short bounded retry, then revoke —
+		// network-outage circuit breaker and the slow failure-run
+		// tracking below. Confirm with a short bounded retry, then revoke —
 		// otherwise a mass logout would trip the breaker and loop forever.
 		for (const [sessionId, outcome] of [...results]) {
 			if (outcome !== "credential_error") continue;
@@ -233,16 +275,16 @@ export class TelegramSessionWatchdog {
 			const client = TelegramClientService.getFromPool(sessionId);
 			if (!client) continue;
 
-			const confirmed = await this.reprobeWithRetries(client);
+			const confirmed = await this.reprobeWithRetries(sessionId, client);
 			if (confirmed === "credential_error") {
-				this.failureCounts.delete(sessionId);
+				this.failureRuns.delete(sessionId);
 				this.lastEmittedReason.delete(sessionId);
 				await TelegramClientService.invalidate(sessionId, "unauthorized");
 				console.log(
 					`[Watchdog] Session credential check failed after ${CREDENTIAL_MAX_RETRIES} retries — revoked`,
 				);
 			} else if (confirmed === "authorized") {
-				this.failureCounts.delete(sessionId);
+				this.failureRuns.delete(sessionId);
 				this.lastEmittedReason.delete(sessionId);
 			}
 			// transient_error → inconclusive; leave state for the next tick
@@ -254,78 +296,259 @@ export class TelegramSessionWatchdog {
 		).length;
 
 		if (failedCount === total && total > 1) {
-			console.warn(
+			this.logAtMostEvery(
+				"all-sessions-failed",
+				REPEATED_LOG_INTERVAL_MS,
+				"warn",
 				`[Watchdog] All ${total} sessions failed authorization — likely a network issue, skipping eviction`,
 			);
+			this.pauseFailureRuns(results);
 			return;
 		}
 
 		if (total > 2 && failedCount / total > 0.5) {
-			console.warn(
+			this.logAtMostEvery(
+				"most-sessions-failed",
+				REPEATED_LOG_INTERVAL_MS,
+				"warn",
 				`[Watchdog] ${failedCount}/${total} sessions failed — likely a network issue, skipping eviction`,
 			);
+			this.pauseFailureRuns(results);
 			return;
 		}
 
-		const sessionInfoCache = new Map<
-			string,
-			{ callback_url: string; telegram_user_id: string }
-		>();
-
 		for (const [sessionId, outcome] of results) {
 			if (outcome === "authorized") {
-				this.failureCounts.delete(sessionId);
+				this.failureRuns.delete(sessionId);
 				this.lastEmittedReason.delete(sessionId);
 				continue;
 			}
 
-			const count = (this.failureCounts.get(sessionId) ?? 0) + 1;
-			this.failureCounts.set(sessionId, count);
+			const failureRun = this.failureRuns.get(sessionId) ?? {
+				failingMilliseconds: 0,
+				failedChecks: 0,
+				lastCountedAt: undefined,
+			};
+			if (failureRun.lastCountedAt !== undefined) {
+				failureRun.failingMilliseconds +=
+					this.tickStartedAt - failureRun.lastCountedAt;
+			}
+			failureRun.lastCountedAt = this.tickStartedAt;
+			failureRun.failedChecks++;
+			this.failureRuns.set(sessionId, failureRun);
 
-			if (count >= REVOKE_AFTER_FAILURES) {
-				this.failureCounts.delete(sessionId);
-				this.lastEmittedReason.delete(sessionId);
-				await TelegramClientService.invalidate(
-					sessionId,
-					"authorization_check_failed",
-				);
-				console.log(
-					`[Watchdog] Session unauthorized ${count} consecutive times — revoked`,
-				);
-			} else {
-				console.warn(
-					`[Watchdog] Session authorization check failed (${count}/${REVOKE_AFTER_FAILURES})`,
-				);
-
-				if (
-					this.lastEmittedReason.get(sessionId) !==
-					"authorization_check_failed"
-				) {
-					const info = await this.resolveSessionInfo(
+			if (
+				failureRun.failingMilliseconds >= REVOKE_AFTER_FAILING_MS &&
+				failureRun.failedChecks >= REVOKE_AFTER_FAILED_CHECKS
+			) {
+				const info = await this.resolveSessionInfo(sessionId);
+				let revoked = true;
+				if (info) {
+					revoked = await this.disconnectThenRevoke(
 						sessionId,
-						sessionInfoCache,
+						info,
+						"authorization_check_failed",
 					);
-					if (info) {
-						await SessionCallbackService.notify(
-							info.callback_url,
-							"telegram_session_disconnected",
-							sessionId,
-							info.telegram_user_id,
-							"disconnected",
-							"authorization_check_failed",
-						);
-						this.lastEmittedReason.set(
-							sessionId,
-							"authorization_check_failed",
-						);
-					}
+				} else {
+					await TelegramClientService.invalidate(
+						sessionId,
+						"authorization_check_failed",
+					);
 				}
+				if (revoked) {
+					this.failureRuns.delete(sessionId);
+					this.lastEmittedReason.delete(sessionId);
+					console.log(
+						`[Watchdog] Session unauthorized ${failureRun.failedChecks} consecutive times — revoked`,
+					);
+				}
+			} else {
+				this.logAtMostEvery(
+					`authorization-failed:${sessionId}`,
+					REPEATED_LOG_INTERVAL_MS,
+					"warn",
+					`[Watchdog] Session authorization check failed (failed checks: ${failureRun.failedChecks}, failing for ${Math.round(failureRun.failingMilliseconds / 1000)}s)`,
+				);
 			}
 		}
 	}
 
+	private pauseFailureRuns(results: Map<string, ProbeOutcome>): void {
+		for (const [sessionId, outcome] of results) {
+			const failureRun = this.failureRuns.get(sessionId);
+			if (!failureRun) continue;
+			if (outcome === "authorized") this.failureRuns.delete(sessionId);
+			else failureRun.lastCountedAt = undefined;
+		}
+	}
+
+	private async disconnectStalledSessions(): Promise<void> {
+		const pooledIds = TelegramClientService.getPooledSessionIds();
+		const now = Date.now();
+		const confirmedStalls: {
+			sessionId: string;
+			localPosition: number;
+			serverPosition: number;
+			stalledForSeconds: number;
+		}[] = [];
+
+		for (const sessionId of this.stallTrackers.keys()) {
+			if (!pooledIds.includes(sessionId)) this.stallTrackers.delete(sessionId);
+		}
+
+		for (const logKey of this.lastLoggedAt.keys()) {
+			const separatorIndex = logKey.indexOf(":");
+			if (
+				separatorIndex !== -1 &&
+				!pooledIds.includes(logKey.slice(separatorIndex + 1))
+			) {
+				this.lastLoggedAt.delete(logKey);
+			}
+		}
+
+		let probeFailedCount = 0;
+		for (const sessionId of pooledIds) {
+			const serverPosition = this.serverPositions.get(sessionId);
+			if (serverPosition === undefined) {
+				this.stallTrackers.delete(sessionId);
+				probeFailedCount++;
+				continue;
+			}
+
+			const client = TelegramClientService.getFromPool(sessionId)?.getClient();
+			const localPosition = client?.updateManager.state?.pts;
+			if (localPosition === undefined || serverPosition <= localPosition) {
+				this.stallTrackers.delete(sessionId);
+				continue;
+			}
+
+			const tracker = this.stallTrackers.get(sessionId);
+			if (!tracker || tracker.localPosition !== localPosition) {
+				this.stallTrackers.set(sessionId, {
+					localPosition,
+					stalledSince: now,
+				});
+				void client?.catchUp();
+				const behindLogKey = `behind:${sessionId}`;
+				if (this.isLogDue(behindLogKey, REPEATED_LOG_INTERVAL_MS)) {
+					const behindInfo = await this.resolveSessionInfo(sessionId).catch(
+							(error) => {
+								console.warn(
+									`[Watchdog] Session lookup for the catch-up log line failed: ${error instanceof Error ? error.message : error}`,
+								);
+								return null;
+							},
+						);
+					if (behindInfo) {
+						this.logAtMostEvery(
+							behindLogKey,
+							REPEATED_LOG_INTERVAL_MS,
+							"warn",
+							`[Watchdog] Session user=${behindInfo.telegram_user_id} is behind the server (local pts=${localPosition}, server pts=${serverPosition}) — requesting catch-up`,
+						);
+					}
+				}
+				continue;
+			}
+
+			if (now - tracker.stalledSince >= STALL_CONFIRM_MS) {
+				confirmedStalls.push({
+					sessionId,
+					localPosition,
+					serverPosition,
+					stalledForSeconds: Math.round((now - tracker.stalledSince) / 1000),
+				});
+			}
+		}
+
+		const behindCount = this.stallTrackers.size + probeFailedCount;
+		if (
+			confirmedStalls.length > 0 &&
+			pooledIds.length > 2 &&
+			behindCount / pooledIds.length > 0.5
+		) {
+			this.logAtMostEvery(
+				"stalled-majority",
+				REPEATED_LOG_INTERVAL_MS,
+				"warn",
+				`[Watchdog] ${behindCount}/${pooledIds.length} sessions stopped receiving updates — likely a Telegram issue, skipping`,
+			);
+			return;
+		}
+
+		for (const stalled of confirmedStalls) {
+			const info = await this.resolveSessionInfo(stalled.sessionId);
+			if (!info) {
+				this.logAtMostEvery(
+					`stalled-without-record:${stalled.sessionId}`,
+					REPEATED_LOG_INTERVAL_MS,
+					"warn",
+					"[Watchdog] Stalled session has no session record — cannot notify or revoke",
+				);
+				continue;
+			}
+
+			this.logAtMostEvery(
+				`stalled:${stalled.sessionId}`,
+				REPEATED_LOG_INTERVAL_MS,
+				"warn",
+				`[Watchdog] Session user=${info.telegram_user_id} stopped receiving updates for ${stalled.stalledForSeconds}s (local pts=${stalled.localPosition}, server pts=${stalled.serverPosition}) — disconnecting`,
+			);
+			await this.disconnectThenRevoke(
+				stalled.sessionId,
+				info,
+				"receiving_updates_stalled",
+			);
+		}
+	}
+
+	private async disconnectThenRevoke(
+		sessionId: string,
+		info: SessionInfo,
+		reason: SessionLifecycleReason,
+	): Promise<boolean> {
+		const accepted = await SessionCallbackService.notify(
+			info.callback_url,
+			"telegram_session_disconnected",
+			sessionId,
+			info.telegram_user_id,
+			"disconnected",
+			reason,
+		);
+
+		if (!accepted) {
+			this.logAtMostEvery(
+				`callback-not-accepted:${sessionId}`,
+				REPEATED_LOG_INTERVAL_MS,
+				"warn",
+				`[Watchdog] Disconnect callback not accepted for user=${info.telegram_user_id} — retrying next tick`,
+			);
+			return false;
+		}
+
+		await TelegramClientService.invalidate(sessionId, reason);
+		return true;
+	}
+
+	private logAtMostEvery(
+		key: string,
+		intervalMs: number,
+		level: "warn" | "error",
+		message: string,
+	): void {
+		if (!this.isLogDue(key, intervalMs)) return;
+
+		this.lastLoggedAt.set(key, Date.now());
+		console[level](message);
+	}
+
+	private isLogDue(key: string, intervalMs: number): boolean {
+		const lastLoggedAt = this.lastLoggedAt.get(key);
+		return lastLoggedAt === undefined || Date.now() - lastLoggedAt >= intervalMs;
+	}
+
 	/**
-	 * Scenario 2: Database has an active session that is not in the pool.
+	 * Scenario 3: Database has an active session that is not in the pool.
 	 *
 	 * Queries the database for all active sessions belonging to this server
 	 * and re-initializes any that are missing from the pool.
@@ -405,7 +628,7 @@ export class TelegramSessionWatchdog {
 				// database row, so the revive loop stops picking it up) and
 				// fire the existing disconnect callback via invalidate().
 				if (TelegramUtils.isCredentialError(error)) {
-					this.failureCounts.delete(session.session_id);
+					this.failureRuns.delete(session.session_id);
 					this.lastEmittedReason.delete(session.session_id);
 					await TelegramClientService.invalidate(
 						session.session_id,
@@ -470,11 +693,7 @@ export class TelegramSessionWatchdog {
 
 	private async resolveSessionInfo(
 		sessionId: string,
-		cache: Map<string, { callback_url: string; telegram_user_id: string }>,
-	): Promise<{ callback_url: string; telegram_user_id: string } | null> {
-		const cached = cache.get(sessionId);
-		if (cached) return cached;
-
+	): Promise<SessionInfo | null> {
 		const rows = await DatabaseClient.getInstance().execute((db) =>
 			db
 				.select({
@@ -493,11 +712,6 @@ export class TelegramSessionWatchdog {
 				)
 				.limit(1),
 		);
-		const record = rows[0] ?? null;
-
-		if (record) {
-			cache.set(sessionId, record);
-		}
-		return record;
+		return rows[0] ?? null;
 	}
 }
