@@ -1,4 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { PgDialect } from "drizzle-orm/pg-core";
+import type { SQL } from "drizzle-orm";
 
 vi.hoisted(() => {
 	process.env.CALLBACK_RETRY_BASE_DELAY_SECONDS = "5";
@@ -14,6 +16,13 @@ vi.hoisted(() => {
 
 interface TrackedUpdate {
 	set: Record<string, unknown>;
+	joinedTable: unknown;
+	where: RenderedCondition;
+}
+
+interface RenderedCondition {
+	sql: string;
+	params: unknown[];
 }
 
 interface TrackedDelete {
@@ -21,30 +30,68 @@ interface TrackedDelete {
 }
 
 let selectResult: Record<string, unknown>[] = [];
+let selectResultQueue: Record<string, unknown>[][] = [];
+let updateRowCount = 0;
 const trackedUpdates: TrackedUpdate[] = [];
 const trackedDeletes: TrackedDelete[] = [];
-let transactionCalled = false;
+const trackedSelectConditions: RenderedCondition[] = [];
+const trackedOrderings: RenderedCondition[] = [];
+const trackedLimits: number[] = [];
+
+const pgDialect = new PgDialect();
+
+function renderCondition(condition: SQL): RenderedCondition {
+	const { sql, params } = pgDialect.sqlToQuery(condition);
+	return { sql, params };
+}
+
+function nextSelectResult(): Record<string, unknown>[] {
+	return selectResultQueue.shift() ?? selectResult;
+}
 
 function createMockDb() {
 	const mockDb: Record<string, unknown> = {
 		select: () => ({
 			from: () => ({
-				where: () => ({
-					orderBy: () => ({
-						limit: () => Promise.resolve(selectResult),
-					}),
-					limit: () => Promise.resolve(selectResult),
-				}),
+				where: (condition: SQL) => {
+					trackedSelectConditions.push(renderCondition(condition));
+					return {
+						orderBy: (ordering: SQL) => {
+							trackedOrderings.push(renderCondition(ordering));
+							return {
+								limit: (limit: number) => {
+									trackedLimits.push(limit);
+									return Promise.resolve(nextSelectResult());
+								},
+							};
+						},
+						limit: () => Promise.resolve(nextSelectResult()),
+					};
+				},
 				orderBy: () => ({
-					limit: () => Promise.resolve(selectResult),
+					limit: () => Promise.resolve(nextSelectResult()),
 				}),
 			}),
 		}),
 		update: () => ({
 			set: (data: Record<string, unknown>) => ({
-				where: () => {
-					trackedUpdates.push({ set: data });
-					return Promise.resolve({});
+				from: (joinedTable: unknown) => ({
+					where: (condition: SQL) => {
+						trackedUpdates.push({
+							set: data,
+							joinedTable,
+							where: renderCondition(condition),
+						});
+						return Promise.resolve({ rowCount: updateRowCount });
+					},
+				}),
+				where: (condition: SQL) => {
+					trackedUpdates.push({
+						set: data,
+						joinedTable: undefined,
+						where: renderCondition(condition),
+					});
+					return Promise.resolve({ rowCount: updateRowCount });
 				},
 			}),
 		}),
@@ -54,10 +101,6 @@ function createMockDb() {
 				return Promise.resolve({});
 			},
 		}),
-		transaction: async (cb: (tx: unknown) => Promise<void>) => {
-			transactionCalled = true;
-			await cb(mockDb);
-		},
 	};
 	return mockDb;
 }
@@ -72,6 +115,7 @@ vi.mock("../../src/database/DatabaseClient", () => ({
 }));
 
 import { DeliveryDispatcher } from "../../src/services/DeliveryDispatcher";
+import { tenantMessageState } from "../../src/database/schema";
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
@@ -80,14 +124,9 @@ const CALLBACK_URL = "https://example.com/callback";
 
 function callForwardNext(
 	sessionId = SESSION_ID,
-	lastForwardedId = BigInt(0),
 	callbackUrl = CALLBACK_URL,
 ): Promise<bigint | null> {
-	return (DeliveryDispatcher as any)["forwardNext"](
-		sessionId,
-		lastForwardedId,
-		callbackUrl,
-	);
+	return (DeliveryDispatcher as any)["forwardNext"](sessionId, callbackUrl);
 }
 
 function mockFetchOk(): void {
@@ -110,9 +149,13 @@ describe("DeliveryDispatcher.forwardNext", () => {
 	beforeEach(() => {
 		vi.clearAllMocks();
 		selectResult = [];
+		updateRowCount = 0;
 		trackedUpdates.length = 0;
 		trackedDeletes.length = 0;
-		transactionCalled = false;
+		trackedSelectConditions.length = 0;
+		trackedOrderings.length = 0;
+		trackedLimits.length = 0;
+		selectResultQueue = [];
 		(DeliveryDispatcher as any).running.clear();
 		(DeliveryDispatcher as any).pendingWake.clear();
 	});
@@ -123,7 +166,7 @@ describe("DeliveryDispatcher.forwardNext", () => {
 	});
 
 	// ── 1. Successful delivery ───────────────────────────────────────
-	it("deletes the message and advances cursor on successful delivery", async () => {
+	it("deletes the message without touching the cursor on successful delivery", async () => {
 		selectResult = [
 			{
 				id: BigInt(10),
@@ -139,13 +182,8 @@ describe("DeliveryDispatcher.forwardNext", () => {
 		const result = await callForwardNext();
 
 		expect(result).toBe(BigInt(10));
-		expect(transactionCalled).toBe(true);
 
-		const cursorUpdate = trackedUpdates.find(
-			(u) => "last_forwarded_id" in u.set,
-		);
-		expect(cursorUpdate).toBeDefined();
-		expect(cursorUpdate!.set.last_forwarded_id).toBe(BigInt(10));
+		expect(trackedUpdates).toEqual([]);
 
 		expect(trackedDeletes.length).toBeGreaterThanOrEqual(1);
 	});
@@ -248,7 +286,6 @@ describe("DeliveryDispatcher.forwardNext", () => {
 		const result = await callForwardNext();
 
 		expect(result).toBeNull();
-		expect(transactionCalled).toBe(true);
 
 		const msgUpdate = trackedUpdates.find(
 			(u) => "status" in u.set && u.set.status === "delivery_failed",
@@ -260,38 +297,9 @@ describe("DeliveryDispatcher.forwardNext", () => {
 		);
 		expect(msgUpdate!.set.next_delivery_attempt_at).toBeNull();
 
-		const cursorUpdate = trackedUpdates.find(
-			(u) => "last_forwarded_id" in u.set,
-		);
-		expect(cursorUpdate).toBeDefined();
-		expect(cursorUpdate!.set.last_forwarded_id).toBe(BigInt(50));
-	});
-
-	// ── 6. Cursor skips delivery_failed messages ─────────────────────
-	it("advances cursor past delivery_failed messages without calling fetch", async () => {
-		selectResult = [
-			{
-				id: BigInt(60),
-				raw_payload: '{"text":"hello"}',
-				status: "delivery_failed",
-				delivery_retry_count: 3,
-				next_delivery_attempt_at: null,
-			},
-		];
-
-		const fetchSpy = vi.fn();
-		vi.stubGlobal("fetch", fetchSpy);
-
-		const result = await callForwardNext();
-
-		expect(result).toBe(BigInt(60));
-		expect(fetchSpy).not.toHaveBeenCalled();
-
-		const cursorUpdate = trackedUpdates.find(
-			(u) => "last_forwarded_id" in u.set,
-		);
-		expect(cursorUpdate).toBeDefined();
-		expect(cursorUpdate!.set.last_forwarded_id).toBe(BigInt(60));
+		expect(
+			trackedUpdates.find((u) => "last_forwarded_id" in u.set),
+		).toBeUndefined();
 	});
 
 	// ── 7. No more messages returns null ──────────────────────────────
@@ -326,8 +334,54 @@ describe("DeliveryDispatcher.forwardNext", () => {
 
 		expect(result).toBe(BigInt(80));
 		expect(fetchSpy).not.toHaveBeenCalled();
-		expect(transactionCalled).toBe(true);
 		expect(trackedDeletes.length).toBeGreaterThanOrEqual(1);
+	});
+
+	// ── New: selection by status, not by cursor ───────────────────────
+	it("selects the oldest downloaded message of the session", async () => {
+		selectResult = [];
+
+		await callForwardNext();
+
+		expect(trackedSelectConditions).toHaveLength(1);
+		const condition = trackedSelectConditions[0];
+		expect(condition.sql).toContain('"messages"."session_id" = $1');
+		expect(condition.sql).toContain('"messages"."status" = $2');
+		expect(condition.sql).not.toContain(">");
+		expect(condition.params).toEqual([SESSION_ID, "downloaded"]);
+		expect(trackedOrderings).toHaveLength(1);
+		expect(trackedOrderings[0].sql).toBe('"messages"."id" asc');
+		expect(trackedLimits).toEqual([1]);
+	});
+
+	it("delivers a lower id that became visible after a higher id was delivered", async () => {
+		const downloadedRow = (id: number) => ({
+			id: BigInt(id),
+			raw_payload: `{"text":"message ${id}"}`,
+			status: "downloaded",
+			delivery_retry_count: 0,
+			next_delivery_attempt_at: null,
+		});
+		selectResultQueue = [[downloadedRow(7)], [downloadedRow(5)], []];
+		const fetchSpy = vi
+			.fn()
+			.mockResolvedValue({ ok: true, status: 200, statusText: "OK" });
+		vi.stubGlobal("fetch", fetchSpy);
+
+		const deliveredIds = [
+			await callForwardNext(),
+			await callForwardNext(),
+			await callForwardNext(),
+		];
+
+		expect(deliveredIds).toEqual([BigInt(7), BigInt(5), null]);
+		expect(fetchSpy.mock.calls.map(([, options]) => options.body)).toEqual([
+			'{"text":"message 7"}',
+			'{"text":"message 5"}',
+		]);
+		for (const condition of trackedSelectConditions) {
+			expect(condition.sql).not.toContain('"messages"."id" >');
+		}
 	});
 
 	// ── 9. Callback POST carries an abort timeout ─────────────────────
@@ -418,5 +472,45 @@ describe("DeliveryDispatcher.wake coalescing", () => {
 		DeliveryDispatcher.wake(SESSION_ID);
 		await settle();
 		expect(drainSpy).toHaveBeenCalledTimes(2);
+	});
+});
+
+describe("DeliveryDispatcher.discardStrandedMessages", () => {
+	beforeEach(() => {
+		vi.clearAllMocks();
+		updateRowCount = 0;
+		trackedUpdates.length = 0;
+	});
+
+	afterEach(() => {
+		vi.restoreAllMocks();
+	});
+
+	it("discards rows stranded behind the old cursor", async () => {
+		updateRowCount = 3;
+		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+		await DeliveryDispatcher.discardStrandedMessages();
+
+		expect(trackedUpdates).toHaveLength(1);
+		expect(trackedUpdates[0].set).toEqual({
+			status: "delivery_failed",
+			delivery_failed_at: expect.any(Date),
+			last_delivery_error: "stranded by the old delivery cursor",
+		});
+		expect(trackedUpdates[0].joinedTable).toBe(tenantMessageState);
+		const condition = trackedUpdates[0].where;
+		expect(condition.sql).toContain(
+			'"messages"."session_id" = "tenant_message_state"."session_id"',
+		);
+		expect(condition.sql).toContain(
+			'"messages"."id" <= "tenant_message_state"."last_forwarded_id"',
+		);
+		expect(condition.sql).toContain('"messages"."status" = $1');
+		expect(condition.sql).not.toContain("select");
+		expect(condition.params).toEqual(["downloaded"]);
+		expect(logSpy).toHaveBeenCalledWith(
+			"[DeliveryDispatcher] Discarded 3 messages stranded by the old delivery cursor",
+		);
 	});
 });

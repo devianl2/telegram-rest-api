@@ -13,6 +13,7 @@ import { TelegramSessionWatchdog } from "./telegram/TelegramSessionWatchdog";
 import { TenantForwardingScheduler } from "./services/TenantForwardingScheduler";
 import { HeapPressureGuard } from "./services/HeapPressureGuard";
 import { S3UploadService } from "./services/S3UploadService";
+import { DeliveryDispatcher } from "./services/DeliveryDispatcher";
 
 const PORT = parseInt(process.env.PORT ?? "3000", 10);
 
@@ -23,6 +24,7 @@ async function bootstrap(): Promise<void> {
 		);
 	}
 
+	await DeliveryDispatcher.discardStrandedMessages();
 	await TelegramClientService.restoreFromDatabase();
 
 	const sessionWatchdog = new TelegramSessionWatchdog();
