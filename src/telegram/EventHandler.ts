@@ -14,6 +14,8 @@ import { TelegramUtils } from "./TelegramUtils";
 import { telegramSessions, messages } from "../database/schema";
 
 const INIT_DELAY_MS = 5000;
+const CATCH_UP_DEADLINE_MS = 120_000;
+const LOST_REPLY_LOG_INTERVAL_MS = 10 * 60_000;
 
 const AUTO_DOWNLOAD_MEDIA = !["false", "0", "no", "off"].includes(
 	(process.env.AUTO_DOWNLOAD_IMAGE_WHEN_RECEIVE ?? "true")
@@ -107,6 +109,8 @@ export class EventHandler {
 	private readonly sessionHash: string;
 
 	private rawHandler: ((update: Api.TypeUpdate) => void) | null = null;
+	private originalInvoke: TelegramClient["invoke"] | null = null;
+	private readonly lostReplyLoggedAt = new Map<string, number>();
 
 	constructor(
 		client: TelegramClient,
@@ -125,6 +129,7 @@ export class EventHandler {
 		};
 
 		this.client.addEventHandler(this.rawHandler, new Raw({}));
+		this.limitCatchUpDuration();
 
 		await this.delay(INIT_DELAY_MS);
 
@@ -142,6 +147,42 @@ export class EventHandler {
 			this.client.removeEventHandler(this.rawHandler, new Raw({}));
 			this.rawHandler = null;
 		}
+		if (this.originalInvoke) {
+			this.client.invoke = this.originalInvoke;
+			this.originalInvoke = null;
+		}
+	}
+
+	private limitCatchUpDuration(): void {
+		const originalInvoke = this.client.invoke;
+		this.originalInvoke = originalInvoke;
+		this.client.invoke = ((request: Api.AnyRequest, dcId?: number) => {
+			const reply = originalInvoke.call(this.client, request, dcId);
+			if (
+				!(
+					request instanceof Api.updates.GetDifference ||
+					request instanceof Api.updates.GetChannelDifference
+				)
+			) {
+				return reply;
+			}
+			return new Promise((resolve, reject) => {
+				const timer = setTimeout(() => {
+					const lastLoggedAt = this.lostReplyLoggedAt.get(request.className);
+					if (
+						lastLoggedAt === undefined ||
+						Date.now() - lastLoggedAt >= LOST_REPLY_LOG_INTERVAL_MS
+					) {
+						this.lostReplyLoggedAt.set(request.className, Date.now());
+						console.warn(
+							`[EventHandler] Catch-up reply lost for user ${this.telegramUserId} after ${CATCH_UP_DEADLINE_MS}ms — retrying`,
+						);
+					}
+					reject(new Error("Catch-up reply lost"));
+				}, CATCH_UP_DEADLINE_MS);
+				reply.then(resolve, reject).finally(() => clearTimeout(timer));
+			});
+		}) as TelegramClient["invoke"];
 	}
 
 	/**

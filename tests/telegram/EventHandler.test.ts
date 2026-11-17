@@ -1,7 +1,9 @@
 import bigInt from "big-integer";
 import Fastify from "fastify";
 import { createHash } from "node:crypto";
-import { Api } from "teleproto";
+import { Api, TelegramClient } from "teleproto";
+import { LogLevel } from "teleproto/extensions/Logger";
+import { StringSession } from "teleproto/sessions";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ChannelRoute } from "../../src/routes/channels/ChannelRoute";
 import { MessageRoute } from "../../src/routes/message/MessageRoute";
@@ -463,5 +465,258 @@ describe("small photo download", () => {
 
 		expect(response.statusCode).toBe(400);
 		expect(response.json().message).toBe("photo 6170 thumbSize m: FILE_REFERENCE_EXPIRED");
+	});
+});
+
+interface OfflineClient {
+	client: TelegramClient;
+	requests: unknown[];
+}
+
+function createOfflineClient(
+	respond: (request: unknown, requestNumber: number) => unknown,
+): OfflineClient {
+	const client = new TelegramClient(new StringSession(""), 1, "hash", {});
+	const requests: unknown[] = [];
+	const internals = client as unknown as {
+		_sender: unknown;
+		_selfInputPeer: unknown;
+		_connectedDeferred: { resolve: () => void };
+		updateManager: {
+			start: () => void;
+			state: unknown;
+			globalPts: { init: (pts: number) => void };
+		};
+	};
+	internals._sender = {
+		userDisconnected: false,
+		addStateToQueue: (state: {
+			request: unknown;
+			resolve: (value: unknown) => void;
+			reject: (reason: unknown) => void;
+		}) => {
+			requests.push(state.request);
+			void Promise.resolve(respond(state.request, requests.length)).then(
+				state.resolve,
+				state.reject,
+			);
+		},
+	};
+	internals._selfInputPeer = new Api.InputPeerUser({
+		userId: bigInt(1),
+		accessHash: bigInt(0),
+	});
+	internals._connectedDeferred.resolve();
+	internals.updateManager.start();
+	internals.updateManager.state = { pts: 100, qts: 0, date: 1, seq: 0 };
+	internals.updateManager.globalPts.init(100);
+	return { client, requests };
+}
+
+function incomingShortMessage(pts: number): Api.UpdateShortMessage {
+	return new Api.UpdateShortMessage({
+		id: pts,
+		userId: bigInt(5),
+		message: "hello",
+		pts,
+		ptsCount: 1,
+		date: 1,
+	});
+}
+
+const emptyDialogs = new Api.messages.Dialogs({
+	dialogs: [],
+	messages: [],
+	chats: [],
+	users: [],
+});
+
+async function startHandler(client: TelegramClient): Promise<EventHandler> {
+	const handler = new EventHandler(client, "7920216818", "session-1");
+	const started = handler.start();
+	await vi.advanceTimersByTimeAsync(5000);
+	await started;
+	return handler;
+}
+
+function spyOnPersist(): Api.TypeUpdate[] {
+	const persisted: Api.TypeUpdate[] = [];
+	vi.spyOn(
+		EventHandler.prototype as unknown as {
+			persistUpdate: (update: Api.TypeUpdate) => Promise<void>;
+		},
+		"persistUpdate",
+	).mockImplementation(async (update) => {
+		persisted.push(update);
+	});
+	return persisted;
+}
+
+describe("catch-up deadline", () => {
+	afterEach(() => {
+		vi.useRealTimers();
+		vi.restoreAllMocks();
+	});
+
+	function catchUpRequests(requests: unknown[]): unknown[] {
+		return requests.filter((request) => request instanceof Api.updates.GetDifference);
+	}
+
+	it("delivers a message again after a lost catch-up reply times out", async () => {
+		vi.useFakeTimers();
+		vi.spyOn(console, "log").mockImplementation(() => {});
+		vi.spyOn(console, "warn").mockImplementation(() => {});
+		const persisted = spyOnPersist();
+		const { client, requests } = createOfflineClient((request) => {
+			if (request instanceof Api.updates.GetDifference) {
+				return catchUpRequests(requests).length === 1
+					? new Promise(() => {})
+					: new Api.updates.DifferenceEmpty({ date: 2, seq: 0 });
+			}
+			return emptyDialogs;
+		});
+		const handler = await startHandler(client);
+
+		void client.updateManager.catchUp();
+		await vi.advanceTimersByTimeAsync(1000);
+		client.updateManager.onUpdates(incomingShortMessage(101));
+		await vi.advanceTimersByTimeAsync(1000);
+		expect(persisted).toHaveLength(0);
+
+		await vi.advanceTimersByTimeAsync(125_000);
+		client.updateManager.onUpdates(incomingShortMessage(101));
+		await vi.advanceTimersByTimeAsync(1000);
+
+		expect(persisted).toHaveLength(1);
+		expect(catchUpRequests(requests)).toHaveLength(2);
+		handler.stop();
+	});
+
+	it("leaves a catch-up reply that arrives in time untouched", async () => {
+		vi.useFakeTimers();
+		vi.spyOn(console, "log").mockImplementation(() => {});
+		const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+		const { client, requests } = createOfflineClient((request) =>
+			request instanceof Api.updates.GetDifference
+				? new Api.updates.DifferenceEmpty({ date: 2, seq: 0 })
+				: emptyDialogs,
+		);
+		const handler = await startHandler(client);
+
+		await client.updateManager.catchUp();
+		await vi.advanceTimersByTimeAsync(300_000);
+
+		expect(catchUpRequests(requests)).toHaveLength(1);
+		expect(warnSpy).not.toHaveBeenCalled();
+		handler.stop();
+	});
+
+	it("ignores a reply that arrives after the deadline", async () => {
+		vi.useFakeTimers();
+		vi.spyOn(console, "log").mockImplementation(() => {});
+		vi.spyOn(console, "warn").mockImplementation(() => {});
+		const unhandled = vi.fn();
+		process.on("unhandledRejection", unhandled);
+		let answerLate: (reply: unknown) => void = () => {};
+		const { client, requests } = createOfflineClient((request) => {
+			if (request instanceof Api.updates.GetDifference) {
+				return catchUpRequests(requests).length === 1
+					? new Promise((resolve) => {
+							answerLate = resolve;
+						})
+					: new Api.updates.DifferenceEmpty({ date: 2, seq: 0 });
+			}
+			return emptyDialogs;
+		});
+		const handler = await startHandler(client);
+
+		void client.updateManager.catchUp();
+		await vi.advanceTimersByTimeAsync(125_000);
+		answerLate(new Api.updates.DifferenceEmpty({ date: 3, seq: 0 }));
+		await vi.advanceTimersByTimeAsync(5000);
+
+		expect(catchUpRequests(requests)).toHaveLength(2);
+		expect(unhandled).not.toHaveBeenCalled();
+		process.off("unhandledRejection", unhandled);
+		handler.stop();
+	});
+
+	it("passes other requests through without a deadline", async () => {
+		vi.useFakeTimers();
+		vi.spyOn(console, "log").mockImplementation(() => {});
+		const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+		const { client } = createOfflineClient((request) =>
+			request instanceof Api.updates.GetState
+				? new Promise(() => {})
+				: emptyDialogs,
+		);
+		const handler = await startHandler(client);
+
+		void client.api.updates.getState();
+		await vi.advanceTimersByTimeAsync(300_000);
+
+		expect(warnSpy).not.toHaveBeenCalled();
+		handler.stop();
+	});
+
+	it("logs one line when the catch-up reply is lost", async () => {
+		vi.useFakeTimers();
+		vi.spyOn(console, "log").mockImplementation(() => {});
+		const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+		const { client } = createOfflineClient((request) =>
+			request instanceof Api.updates.GetDifference
+				? new Promise(() => {})
+				: emptyDialogs,
+		);
+		const handler = await startHandler(client);
+
+		void client.updateManager.catchUp();
+		await vi.advanceTimersByTimeAsync(125_000);
+
+		expect(warnSpy).toHaveBeenCalledTimes(1);
+		expect(warnSpy).toHaveBeenCalledWith(
+			"[EventHandler] Catch-up reply lost for user 7920216818 after 120000ms — retrying",
+		);
+		handler.stop();
+	});
+
+	it("logs a repeated lost catch-up reply once per ten minutes", async () => {
+		vi.useFakeTimers();
+		vi.spyOn(console, "log").mockImplementation(() => {});
+		const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+		const { client, requests } = createOfflineClient((request) =>
+			request instanceof Api.updates.GetDifference
+				? new Promise(() => {})
+				: emptyDialogs,
+		);
+		const handler = await startHandler(client);
+
+		for (let attempt = 0; attempt < 3; attempt++) {
+			void client.updateManager.catchUp();
+			await vi.advanceTimersByTimeAsync(125_000);
+		}
+
+		expect(catchUpRequests(requests).length).toBeGreaterThan(2);
+		expect(warnSpy).toHaveBeenCalledTimes(1);
+
+		await vi.advanceTimersByTimeAsync(10 * 60_000);
+		void client.updateManager.catchUp();
+		await vi.advanceTimersByTimeAsync(125_000);
+
+		expect(warnSpy).toHaveBeenCalledTimes(2);
+		handler.stop();
+	});
+
+	it("restores the client functions on stop", async () => {
+		vi.useFakeTimers();
+		vi.spyOn(console, "log").mockImplementation(() => {});
+		const { client } = createOfflineClient(() => emptyDialogs);
+		const originalInvoke = client.invoke;
+		const handler = await startHandler(client);
+		expect(client.invoke).not.toBe(originalInvoke);
+
+		handler.stop();
+
+		expect(client.invoke).toBe(originalInvoke);
 	});
 });

@@ -263,6 +263,8 @@ export class TelegramClientService implements TelegramClientInterface {
 		client: TelegramClientService,
 		telegramUserId: string,
 	): void {
+		TelegramClientService.stopEventHandler(sessionId);
+
 		const handler = new EventHandler(
 			client.getClient(),
 			telegramUserId,
