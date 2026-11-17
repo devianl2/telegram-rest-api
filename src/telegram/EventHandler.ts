@@ -15,7 +15,14 @@ import { telegramSessions, messages } from "../database/schema";
 
 const INIT_DELAY_MS = 5000;
 const CATCH_UP_DEADLINE_MS = 120_000;
+const DIALOG_RELOAD_INTERVAL_MS = 10 * 60_000;
 const LOST_REPLY_LOG_INTERVAL_MS = 10 * 60_000;
+const DIALOG_LIMIT = 100;
+
+type ChannelResolver = (
+	channelId: string,
+	tracker: unknown,
+) => Promise<Api.InputChannel | undefined>;
 
 const AUTO_DOWNLOAD_MEDIA = !["false", "0", "no", "off"].includes(
 	(process.env.AUTO_DOWNLOAD_IMAGE_WHEN_RECEIVE ?? "true")
@@ -110,7 +117,11 @@ export class EventHandler {
 
 	private rawHandler: ((update: Api.TypeUpdate) => void) | null = null;
 	private originalInvoke: TelegramClient["invoke"] | null = null;
+	private originalResolveChannel: ChannelResolver | null = null;
+	private dialogReload: Promise<boolean> | null = null;
+	private readonly dialogReloadStartedAt = new Map<string, number>();
 	private readonly lostReplyLoggedAt = new Map<string, number>();
+	private readonly unresolvedGroupLoggedAt = new Map<string, number>();
 
 	constructor(
 		client: TelegramClient,
@@ -130,11 +141,12 @@ export class EventHandler {
 
 		this.client.addEventHandler(this.rawHandler, new Raw({}));
 		this.limitCatchUpDuration();
+		this.reloadDialogsForUnknownSupergroup();
 
 		await this.delay(INIT_DELAY_MS);
 
 		try {
-			await this.client.getDialogs({ limit: 100 });
+			await this.client.getDialogs({ limit: DIALOG_LIMIT });
 		} catch {
 			// Non-fatal — events still work if update state is already present
 		}
@@ -150,6 +162,79 @@ export class EventHandler {
 		if (this.originalInvoke) {
 			this.client.invoke = this.originalInvoke;
 			this.originalInvoke = null;
+		}
+		if (this.originalResolveChannel) {
+			(
+				this.client.updateManager as unknown as { resolveChannel: ChannelResolver }
+			).resolveChannel = this.originalResolveChannel;
+			this.originalResolveChannel = null;
+		}
+	}
+
+	private reloadDialogsForUnknownSupergroup(): void {
+		const updateManager = this.client.updateManager as unknown as {
+			resolveChannel: ChannelResolver;
+		};
+		const originalResolveChannel = updateManager.resolveChannel;
+		this.originalResolveChannel = originalResolveChannel;
+		updateManager.resolveChannel = async (channelId, tracker) => {
+			const inputChannel = await originalResolveChannel.call(
+				updateManager,
+				channelId,
+				tracker,
+			);
+			if (inputChannel) return inputChannel;
+
+			const groupId = String(channelId);
+			const startedAt = this.dialogReloadStartedAt.get(groupId);
+			if (
+				startedAt !== undefined &&
+				Date.now() - startedAt < DIALOG_RELOAD_INTERVAL_MS
+			) {
+				return undefined;
+			}
+
+			if (!this.dialogReload) {
+				this.dialogReloadStartedAt.set(groupId, Date.now());
+				this.dialogReload = this.reloadDialogs().finally(() => {
+					this.dialogReload = null;
+				});
+			}
+			if (!(await this.dialogReload)) return undefined;
+
+			const reloadedChannel = await originalResolveChannel.call(
+				updateManager,
+				channelId,
+				tracker,
+			);
+			const lastLoggedAt = this.unresolvedGroupLoggedAt.get(groupId);
+			if (
+				!reloadedChannel &&
+				(lastLoggedAt === undefined ||
+					Date.now() - lastLoggedAt >= DIALOG_RELOAD_INTERVAL_MS)
+			) {
+				this.unresolvedGroupLoggedAt.set(groupId, Date.now());
+				console.warn(
+					`[EventHandler] Supergroup ${groupId} not resolvable for user ${this.telegramUserId} — updates of this group are skipped`,
+				);
+			}
+			return reloadedChannel;
+		};
+	}
+
+	private async reloadDialogs(): Promise<boolean> {
+		try {
+			await TelegramUtils.withTimeout(
+				this.client.getDialogs({ limit: DIALOG_LIMIT }),
+				CATCH_UP_DEADLINE_MS,
+				"dialog reload timed out",
+			);
+			return true;
+		} catch (error) {
+			console.warn(
+				`[EventHandler] Dialog reload failed for user ${this.telegramUserId}: ${error instanceof Error ? error.message : error}`,
+			);
+			return false;
 		}
 	}
 
