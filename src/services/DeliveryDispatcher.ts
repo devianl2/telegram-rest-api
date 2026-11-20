@@ -1,4 +1,4 @@
-import { eq, and, gt, asc } from "drizzle-orm";
+import { eq, and, asc, lte } from "drizzle-orm";
 import { NodePgDatabase } from "drizzle-orm/node-postgres";
 import { DatabaseClient } from "../database/DatabaseClient";
 import { messages, telegramSessions, tenantMessageState } from "../database/schema";
@@ -26,7 +26,7 @@ const CALLBACK_TIMEOUT_MS = parseInt(
  * Push-based message delivery.
  *
  * Every session has (at most) one lightweight delivery chain — an async loop
- * that drains that session's queue in strict FIFO order and then goes idle.
+ * that drains that session's queue, oldest `id` first, and then goes idle.
  * `wake(sessionId)` is called the moment a message row is inserted
  * (EventHandler) and by the recovery sweeper (TenantForwardingScheduler), so
  * delivery starts within milliseconds of arrival instead of waiting for a
@@ -39,13 +39,13 @@ const CALLBACK_TIMEOUT_MS = parseInt(
  *
  * Wake coalescing: wakes arriving while a chain is running set a pending
  * flag and return; the chain re-drains before going idle, so no wake is ever
- * lost and no session ever has two concurrent chains (which would break FIFO).
+ * lost and no session ever has two concurrent chains (which would break the
+ * delivery order).
  *
  * Retry behaviour is unchanged from the original scheduler: a failed POST
  * sets `next_delivery_attempt_at` with linear back-off and the chain parks;
  * the sweeper re-wakes the session once the delay expires. After
- * `CALLBACK_MAX_RETRIES` the message is marked `delivery_failed` and the
- * cursor advances past it.
+ * `CALLBACK_MAX_RETRIES` the message is marked `delivery_failed`.
  */
 export class DeliveryDispatcher {
 	/** Sessions with a currently running delivery chain. */
@@ -99,9 +99,10 @@ export class DeliveryDispatcher {
 	}
 
 	/**
-	 * Delivers every currently deliverable message for the session in
-	 * ascending `id` order, then returns. Stops early when the head of the
-	 * queue is waiting on its retry delay or fails its POST.
+	 * Delivers every currently deliverable message for the session, oldest
+	 * `id` first among those visible now, then returns. A row that commits
+	 * late is delivered after newer ones already sent. Stops early when the
+	 * head of the queue is waiting on its retry delay or fails its POST.
 	 */
 	private static async drainSession(sessionId: bigint): Promise<void> {
 		const db = DatabaseClient.getInstance();
@@ -122,53 +123,24 @@ export class DeliveryDispatcher {
 			return;
 		}
 
-		const stateRows = await db.execute(async (d) => {
-			const existing = await d
-				.select({
-					last_forwarded_id: tenantMessageState.last_forwarded_id,
-				})
-				.from(tenantMessageState)
-				.where(eq(tenantMessageState.session_id, sessionId))
-				.limit(1);
-
-			if (existing.length > 0) return existing;
-
-			await d.insert(tenantMessageState).values({
-				session_id: sessionId,
-				last_forwarded_id: BigInt(0),
-				updated_at: new Date(),
-			});
-			return [{ last_forwarded_id: BigInt(0) }];
-		});
-
-		let lastForwardedId = stateRows[0].last_forwarded_id;
-		let nextId: bigint | null;
+		let deliveredId: bigint | null;
 
 		do {
-			nextId = await this.forwardNext(
-				sessionId,
-				lastForwardedId,
-				session.callback_url,
-			);
-			if (nextId !== null) {
-				lastForwardedId = nextId;
-			}
-		} while (nextId !== null);
+			deliveredId = await this.forwardNext(sessionId, session.callback_url);
+		} while (deliveredId !== null);
 	}
 
 	/**
-	 * Finds the next message after `lastForwardedId` for the session and
-	 * attempts to forward it.
+	 * Finds the oldest `downloaded` message of the session and attempts to
+	 * forward it.
 	 *
-	 * Returns the forwarded message's `id` (the new cursor) on success,
-	 * or `null` when:
+	 * Returns the forwarded message's `id` on success, or `null` when:
 	 *  - There are no more messages to forward
 	 *  - The next message is waiting for its retry delay to expire
 	 *  - The HTTP POST to the callback URL failed
 	 */
 	private static async forwardNext(
 		sessionId: bigint,
-		lastForwardedId: bigint,
 		callbackUrl: string,
 	): Promise<bigint | null> {
 		const db = DatabaseClient.getInstance();
@@ -178,7 +150,6 @@ export class DeliveryDispatcher {
 				.select({
 					id: messages.id,
 					raw_payload: messages.raw_payload,
-					status: messages.status,
 					delivery_retry_count: messages.delivery_retry_count,
 					next_delivery_attempt_at: messages.next_delivery_attempt_at,
 				})
@@ -186,7 +157,7 @@ export class DeliveryDispatcher {
 				.where(
 					and(
 						eq(messages.session_id, sessionId),
-						gt(messages.id, lastForwardedId),
+						eq(messages.status, "downloaded"),
 					),
 				)
 				.orderBy(asc(messages.id))
@@ -194,20 +165,6 @@ export class DeliveryDispatcher {
 
 			const nextMsg = rows[0];
 			if (!nextMsg) return null;
-
-			if (
-				nextMsg.status === "forwarded" ||
-				nextMsg.status === "delivery_failed"
-			) {
-				await d
-					.update(tenantMessageState)
-					.set({
-						last_forwarded_id: nextMsg.id,
-						updated_at: new Date(),
-					})
-					.where(eq(tenantMessageState.session_id, sessionId));
-				return nextMsg.id;
-			}
 
 			if (
 				nextMsg.next_delivery_attempt_at &&
@@ -222,13 +179,12 @@ export class DeliveryDispatcher {
 			);
 
 			if (postResult.ok) {
-				await this.handleDeliverySuccess(d, sessionId, nextMsg.id);
+				await d.delete(messages).where(eq(messages.id, nextMsg.id));
 				return nextMsg.id;
 			}
 
 			await this.handleDeliveryFailure(
 				d,
-				sessionId,
 				nextMsg.id,
 				nextMsg.delivery_retry_count,
 				postResult.error,
@@ -237,34 +193,39 @@ export class DeliveryDispatcher {
 		});
 	}
 
-	/**
-	 * On successful delivery: advance the cursor and delete the message row.
-	 */
-	private static async handleDeliverySuccess(
-		db: NodePgDatabase,
-		sessionId: bigint,
-		messageId: bigint,
-	): Promise<void> {
-		await db.transaction(async (tx) => {
-			await tx
-				.update(tenantMessageState)
+	static async discardStrandedMessages(): Promise<void> {
+		const db = DatabaseClient.getInstance();
+
+		const discarded = await db.execute((d) =>
+			d
+				.update(messages)
 				.set({
-					last_forwarded_id: messageId,
-					updated_at: new Date(),
+					status: "delivery_failed",
+					delivery_failed_at: new Date(),
+					last_delivery_error: "stranded by the old delivery cursor",
 				})
-				.where(eq(tenantMessageState.session_id, sessionId));
-			await tx.delete(messages).where(eq(messages.id, messageId));
-		});
+				.from(tenantMessageState)
+				.where(
+					and(
+						eq(messages.session_id, tenantMessageState.session_id),
+						lte(messages.id, tenantMessageState.last_forwarded_id),
+						eq(messages.status, "downloaded"),
+					),
+				),
+		);
+
+		console.log(
+			`[DeliveryDispatcher] Discarded ${discarded.rowCount} messages stranded by the old delivery cursor`,
+		);
 	}
 
 	/**
 	 * On failed delivery: increment the retry counter and schedule the next
 	 * attempt using linear back-off (`attempt * base`).  If retries are
-	 * exhausted, mark the message as permanently failed and advance the cursor.
+	 * exhausted, mark the message as permanently failed.
 	 */
 	private static async handleDeliveryFailure(
 		db: NodePgDatabase,
-		sessionId: bigint,
 		messageId: bigint,
 		currentRetryCount: number,
 		errorMessage: string,
@@ -272,26 +233,17 @@ export class DeliveryDispatcher {
 		const newRetryCount = currentRetryCount + 1;
 
 		if (newRetryCount >= CALLBACK_MAX_RETRIES) {
-			await db.transaction(async (tx) => {
-				await tx
-					.update(messages)
-					.set({
-						status: "delivery_failed",
-						delivery_retry_count: newRetryCount,
-						delivery_failed_at: new Date(),
-						last_delivery_error: errorMessage,
-						next_delivery_attempt_at: null,
-						updated_at: new Date(),
-					})
-					.where(eq(messages.id, messageId));
-				await tx
-					.update(tenantMessageState)
-					.set({
-						last_forwarded_id: messageId,
-						updated_at: new Date(),
-					})
-					.where(eq(tenantMessageState.session_id, sessionId));
-			});
+			await db
+				.update(messages)
+				.set({
+					status: "delivery_failed",
+					delivery_retry_count: newRetryCount,
+					delivery_failed_at: new Date(),
+					last_delivery_error: errorMessage,
+					next_delivery_attempt_at: null,
+					updated_at: new Date(),
+				})
+				.where(eq(messages.id, messageId));
 
 			console.error(
 				`[DeliveryDispatcher] Message ${messageId} permanently failed after ${newRetryCount} attempts: ${errorMessage}`,

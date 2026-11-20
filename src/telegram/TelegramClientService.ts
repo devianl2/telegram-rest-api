@@ -11,6 +11,9 @@ import {
 	type SessionLifecycleReason,
 } from "../services/SessionCallbackService";
 import { telegramSessions } from "../database/schema";
+import { TelegramUtils } from "./TelegramUtils";
+
+const LOGOUT_DEADLINE_MS = 10_000;
 
 interface TelegramSessionRecord {
 	id: bigint;
@@ -135,6 +138,25 @@ export class TelegramClientService implements TelegramClientInterface {
 		return TelegramClientService.pool.get(sessionId);
 	}
 
+	static async findSessionRecord(sessionId: string) {
+		const sessionRows = await DatabaseClient.getInstance().execute((database) =>
+			database
+				.select({
+					callback_url: telegramSessions.callback_url,
+					telegram_user_id: telegramSessions.telegram_user_id,
+				})
+				.from(telegramSessions)
+				.where(
+					and(
+						eq(telegramSessions.session_id, sessionId),
+						eq(telegramSessions.server_name, process.env.SERVER_NAME ?? ""),
+					),
+				)
+				.limit(1),
+		);
+		return sessionRows[0] ?? null;
+	}
+
 	/**
 	 * Invalidates a session: stops its handlers, deletes the session record
 	 * (cascades to messages and tenant state), logs out from Telegram, and
@@ -145,29 +167,14 @@ export class TelegramClientService implements TelegramClientInterface {
 	 */
 	static async invalidate(
 		sessionId: string,
-		reason: SessionLifecycleReason = "unauthorized",
+		reason: SessionLifecycleReason,
 	): Promise<boolean> {
 		TelegramClientService.stopEventHandler(sessionId);
 
 		const serverName = process.env.SERVER_NAME ?? "";
 		const db = DatabaseClient.getInstance();
 
-		const sessionRows = await db.execute((d) =>
-			d
-				.select({
-					callback_url: telegramSessions.callback_url,
-					telegram_user_id: telegramSessions.telegram_user_id,
-				})
-				.from(telegramSessions)
-				.where(
-					and(
-						eq(telegramSessions.session_id, sessionId),
-						eq(telegramSessions.server_name, serverName),
-					),
-				)
-				.limit(1),
-		);
-		const sessionRecord = sessionRows[0] ?? null;
+		const sessionRecord = await TelegramClientService.findSessionRecord(sessionId);
 
 		const result = await db.execute((d) =>
 			d
@@ -184,18 +191,26 @@ export class TelegramClientService implements TelegramClientInterface {
 			return false;
 		}
 
-		if (TelegramClientService.isPooled(sessionId)) {
-			const client = TelegramClientService.pool.get(
-				sessionId,
-			) as TelegramClientService;
+		const pooledClient = TelegramClientService.pool.get(sessionId);
+		if (pooledClient) {
+			TelegramClientService.pool.delete(sessionId);
 
 			try {
-				await client.getClient().invoke(new Api.auth.LogOut());
-				await client.destroy();
-			} catch {
-				// Client may already be in a broken state; ignore destroy errors
+				await TelegramUtils.withTimeout(
+					pooledClient.getClient().invoke(new Api.auth.LogOut()),
+					LOGOUT_DEADLINE_MS,
+					"logout timed out",
+				);
+			} catch (error) {
+				console.warn(
+					`[Session] Logout not confirmed for user ${sessionRecord?.telegram_user_id}: ${error instanceof Error ? error.message : error}`,
+				);
 			}
-			TelegramClientService.pool.delete(sessionId);
+			pooledClient.destroy().catch((error) => {
+				console.error(
+					`[Session] Closing client failed for user ${sessionRecord?.telegram_user_id}: ${error instanceof Error ? error.message : error}`,
+				);
+			});
 		}
 
 		if (sessionRecord?.callback_url) {
@@ -263,6 +278,8 @@ export class TelegramClientService implements TelegramClientInterface {
 		client: TelegramClientService,
 		telegramUserId: string,
 	): void {
+		TelegramClientService.stopEventHandler(sessionId);
+
 		const handler = new EventHandler(
 			client.getClient(),
 			telegramUserId,

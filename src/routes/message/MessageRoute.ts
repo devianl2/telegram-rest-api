@@ -66,8 +66,8 @@ async function downloadAndUploadToS3(
 			try {
 				buffer = toBuffer(await client.downloadFile(location, { dcId: photo.dcId }));
 			} catch (err) {
-				// Prefixed, not wrapped: withTelegramSession and ErrorResponse read
-				// `code` / `errorMessage` off the original Telegram error.
+				// Prefixed, not wrapped: ErrorResponse reads `code` / `errorMessage`
+				// off the original Telegram error.
 				if (err instanceof Error) {
 					err.message = `photo ${photo.id} thumbSize ${size.type}: ${err.message}`;
 				}

@@ -1,3 +1,9 @@
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "100m"
+    max-file: "20"
+
 services:
   api:
     build:
@@ -14,6 +20,7 @@ services:
       # Hosts are 4GB and dedicated to this stack; default V8 heap (~2GB) was
       # exhausted in production (fatal OOM abort). Leave ~1GB for native/system.
       - NODE_OPTIONS=--max-old-space-size=2560
+    logging: *logging
 
   # Proxies all traffic to the API, except /storage/ which is served directly.
   # Update STORAGE_BASE_URL in .env to the nginx host (e.g. http://<host>).
@@ -29,3 +36,4 @@ services:
       - ${SSL_CERT_DIR}:/etc/nginx/ssl:ro
     depends_on:
       - api
+    logging: *logging

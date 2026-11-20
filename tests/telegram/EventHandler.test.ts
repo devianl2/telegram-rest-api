@@ -1,7 +1,9 @@
 import bigInt from "big-integer";
 import Fastify from "fastify";
 import { createHash } from "node:crypto";
-import { Api } from "teleproto";
+import { Api, TelegramClient } from "teleproto";
+import { LogLevel } from "teleproto/extensions/Logger";
+import { StringSession } from "teleproto/sessions";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ChannelRoute } from "../../src/routes/channels/ChannelRoute";
 import { MessageRoute } from "../../src/routes/message/MessageRoute";
@@ -463,5 +465,652 @@ describe("small photo download", () => {
 
 		expect(response.statusCode).toBe(400);
 		expect(response.json().message).toBe("photo 6170 thumbSize m: FILE_REFERENCE_EXPIRED");
+	});
+});
+
+interface OfflineClient {
+	client: TelegramClient;
+	requests: unknown[];
+}
+
+function createOfflineClient(
+	respond: (request: unknown, requestNumber: number) => unknown,
+): OfflineClient {
+	const client = new TelegramClient(new StringSession(""), 1, "hash", {});
+	const requests: unknown[] = [];
+	const internals = client as unknown as {
+		_sender: unknown;
+		_selfInputPeer: unknown;
+		_connectedDeferred: { resolve: () => void };
+		updateManager: {
+			start: () => void;
+			state: unknown;
+			globalPts: { init: (pts: number) => void };
+		};
+	};
+	internals._sender = {
+		userDisconnected: false,
+		addStateToQueue: (state: {
+			request: unknown;
+			resolve: (value: unknown) => void;
+			reject: (reason: unknown) => void;
+		}) => {
+			requests.push(state.request);
+			void Promise.resolve(respond(state.request, requests.length)).then(
+				state.resolve,
+				state.reject,
+			);
+		},
+	};
+	internals._selfInputPeer = new Api.InputPeerUser({
+		userId: bigInt(1),
+		accessHash: bigInt(0),
+	});
+	internals._connectedDeferred.resolve();
+	internals.updateManager.start();
+	internals.updateManager.state = { pts: 100, qts: 0, date: 1, seq: 0 };
+	internals.updateManager.globalPts.init(100);
+	return { client, requests };
+}
+
+function incomingShortMessage(pts: number): Api.UpdateShortMessage {
+	return new Api.UpdateShortMessage({
+		id: pts,
+		userId: bigInt(5),
+		message: "hello",
+		pts,
+		ptsCount: 1,
+		date: 1,
+	});
+}
+
+const emptyDialogs = new Api.messages.Dialogs({
+	dialogs: [],
+	messages: [],
+	chats: [],
+	users: [],
+});
+
+async function startHandler(client: TelegramClient): Promise<EventHandler> {
+	const handler = new EventHandler(client, "7920216818", "session-1");
+	const started = handler.start();
+	await vi.advanceTimersByTimeAsync(5000);
+	await started;
+	return handler;
+}
+
+function spyOnPersist(): Api.TypeUpdate[] {
+	const persisted: Api.TypeUpdate[] = [];
+	vi.spyOn(
+		EventHandler.prototype as unknown as {
+			persistUpdate: (update: Api.TypeUpdate) => Promise<void>;
+		},
+		"persistUpdate",
+	).mockImplementation(async (update) => {
+		persisted.push(update);
+	});
+	return persisted;
+}
+
+describe("catch-up deadline", () => {
+	afterEach(() => {
+		vi.useRealTimers();
+		vi.restoreAllMocks();
+	});
+
+	function catchUpRequests(requests: unknown[]): unknown[] {
+		return requests.filter((request) => request instanceof Api.updates.GetDifference);
+	}
+
+	it("delivers a message again after a lost catch-up reply times out", async () => {
+		vi.useFakeTimers();
+		vi.spyOn(console, "log").mockImplementation(() => {});
+		vi.spyOn(console, "warn").mockImplementation(() => {});
+		const persisted = spyOnPersist();
+		const { client, requests } = createOfflineClient((request) => {
+			if (request instanceof Api.updates.GetDifference) {
+				return catchUpRequests(requests).length === 1
+					? new Promise(() => {})
+					: new Api.updates.DifferenceEmpty({ date: 2, seq: 0 });
+			}
+			return emptyDialogs;
+		});
+		const handler = await startHandler(client);
+
+		void client.updateManager.catchUp();
+		await vi.advanceTimersByTimeAsync(1000);
+		client.updateManager.onUpdates(incomingShortMessage(101));
+		await vi.advanceTimersByTimeAsync(1000);
+		expect(persisted).toHaveLength(0);
+
+		await vi.advanceTimersByTimeAsync(125_000);
+		client.updateManager.onUpdates(incomingShortMessage(101));
+		await vi.advanceTimersByTimeAsync(1000);
+
+		expect(persisted).toHaveLength(1);
+		expect(catchUpRequests(requests)).toHaveLength(2);
+		handler.stop();
+	});
+
+	it("leaves a catch-up reply that arrives in time untouched", async () => {
+		vi.useFakeTimers();
+		vi.spyOn(console, "log").mockImplementation(() => {});
+		const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+		const { client, requests } = createOfflineClient((request) =>
+			request instanceof Api.updates.GetDifference
+				? new Api.updates.DifferenceEmpty({ date: 2, seq: 0 })
+				: emptyDialogs,
+		);
+		const handler = await startHandler(client);
+
+		await client.updateManager.catchUp();
+		await vi.advanceTimersByTimeAsync(300_000);
+
+		expect(catchUpRequests(requests)).toHaveLength(1);
+		expect(warnSpy).not.toHaveBeenCalled();
+		handler.stop();
+	});
+
+	it("ignores a reply that arrives after the deadline", async () => {
+		vi.useFakeTimers();
+		vi.spyOn(console, "log").mockImplementation(() => {});
+		vi.spyOn(console, "warn").mockImplementation(() => {});
+		const unhandled = vi.fn();
+		process.on("unhandledRejection", unhandled);
+		let answerLate: (reply: unknown) => void = () => {};
+		const { client, requests } = createOfflineClient((request) => {
+			if (request instanceof Api.updates.GetDifference) {
+				return catchUpRequests(requests).length === 1
+					? new Promise((resolve) => {
+							answerLate = resolve;
+						})
+					: new Api.updates.DifferenceEmpty({ date: 2, seq: 0 });
+			}
+			return emptyDialogs;
+		});
+		const handler = await startHandler(client);
+
+		void client.updateManager.catchUp();
+		await vi.advanceTimersByTimeAsync(125_000);
+		answerLate(new Api.updates.DifferenceEmpty({ date: 3, seq: 0 }));
+		await vi.advanceTimersByTimeAsync(5000);
+
+		expect(catchUpRequests(requests)).toHaveLength(2);
+		expect(unhandled).not.toHaveBeenCalled();
+		process.off("unhandledRejection", unhandled);
+		handler.stop();
+	});
+
+	it("passes other requests through without a deadline", async () => {
+		vi.useFakeTimers();
+		vi.spyOn(console, "log").mockImplementation(() => {});
+		const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+		const { client } = createOfflineClient((request) =>
+			request instanceof Api.updates.GetState
+				? new Promise(() => {})
+				: emptyDialogs,
+		);
+		const handler = await startHandler(client);
+
+		void client.api.updates.getState();
+		await vi.advanceTimersByTimeAsync(300_000);
+
+		expect(warnSpy).not.toHaveBeenCalled();
+		handler.stop();
+	});
+
+	it("logs one line when the catch-up reply is lost", async () => {
+		vi.useFakeTimers();
+		vi.spyOn(console, "log").mockImplementation(() => {});
+		const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+		const { client } = createOfflineClient((request) =>
+			request instanceof Api.updates.GetDifference
+				? new Promise(() => {})
+				: emptyDialogs,
+		);
+		const handler = await startHandler(client);
+
+		void client.updateManager.catchUp();
+		await vi.advanceTimersByTimeAsync(125_000);
+
+		expect(warnSpy).toHaveBeenCalledTimes(1);
+		expect(warnSpy).toHaveBeenCalledWith(
+			"[EventHandler] Catch-up reply lost for user 7920216818 after 120000ms — retrying",
+		);
+		handler.stop();
+	});
+
+	it("logs a repeated lost catch-up reply once per ten minutes", async () => {
+		vi.useFakeTimers();
+		vi.spyOn(console, "log").mockImplementation(() => {});
+		const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+		const { client, requests } = createOfflineClient((request) =>
+			request instanceof Api.updates.GetDifference
+				? new Promise(() => {})
+				: emptyDialogs,
+		);
+		const handler = await startHandler(client);
+
+		for (let attempt = 0; attempt < 3; attempt++) {
+			void client.updateManager.catchUp();
+			await vi.advanceTimersByTimeAsync(125_000);
+		}
+
+		expect(catchUpRequests(requests).length).toBeGreaterThan(2);
+		expect(warnSpy).toHaveBeenCalledTimes(1);
+
+		await vi.advanceTimersByTimeAsync(10 * 60_000);
+		void client.updateManager.catchUp();
+		await vi.advanceTimersByTimeAsync(125_000);
+
+		expect(warnSpy).toHaveBeenCalledTimes(2);
+		handler.stop();
+	});
+
+	it("restores the client functions on stop", async () => {
+		vi.useFakeTimers();
+		vi.spyOn(console, "log").mockImplementation(() => {});
+		const { client } = createOfflineClient(() => emptyDialogs);
+		const originalInvoke = client.invoke;
+		const handler = await startHandler(client);
+		expect(client.invoke).not.toBe(originalInvoke);
+
+		handler.stop();
+
+		expect(client.invoke).toBe(originalInvoke);
+	});
+});
+
+describe("supergroup lookup", () => {
+	const GROUP_ID = 1234567890;
+	const OTHER_GROUP_ID = 987654321;
+
+	afterEach(() => {
+		vi.useRealTimers();
+		vi.restoreAllMocks();
+	});
+
+	function supergroup(channelId: number): Api.Channel {
+		return new Api.Channel({
+			id: bigInt(channelId),
+			accessHash: bigInt(777),
+			title: "group",
+			photo: new Api.ChatPhotoEmpty(),
+			date: 1,
+			megagroup: true,
+		});
+	}
+
+	function createClientWithUnknownGroups(
+		knownAfterReload: number[],
+		respondChannelDifference: (requestNumber: number) => unknown = () =>
+			new Api.updates.ChannelDifferenceEmpty({ final: true, pts: 20 }),
+	): OfflineClient {
+		const offline = createOfflineClient((request) => {
+			if (request instanceof Api.messages.GetDialogs) {
+				return new Api.messages.Dialogs({
+					dialogs: [],
+					messages: [],
+					chats:
+						offline.requests.filter((sent) => sent instanceof Api.messages.GetDialogs)
+							.length > 1
+							? knownAfterReload.map(supergroup)
+							: [],
+					users: [],
+				});
+			}
+			if (request instanceof Api.channels.GetChannels) {
+				return Promise.reject(
+					Object.assign(new Error("CHANNEL_INVALID"), {
+						errorMessage: "CHANNEL_INVALID",
+					}),
+				);
+			}
+			if (request instanceof Api.updates.GetChannelDifference) {
+				return respondChannelDifference(
+					offline.requests.filter(
+						(sent) => sent instanceof Api.updates.GetChannelDifference,
+					).length,
+				);
+			}
+			return emptyDialogs;
+		});
+		offline.client.setLogLevel(LogLevel.NONE);
+		return offline;
+	}
+
+	async function triggerChannelDifference(
+		client: TelegramClient,
+		channelId: number,
+		firstPts: number,
+	): Promise<void> {
+		client.updateManager.onUpdates(
+			new Api.UpdateShort({
+				update: new Api.UpdateChannelTooLong({ channelId: bigInt(channelId), pts: firstPts }),
+				date: 1,
+			}),
+		);
+		client.updateManager.onUpdates(
+			new Api.UpdateShort({
+				update: new Api.UpdateChannelTooLong({
+					channelId: bigInt(channelId),
+					pts: firstPts + 10,
+				}),
+				date: 1,
+			}),
+		);
+		await vi.advanceTimersByTimeAsync(1000);
+	}
+
+	function sent(requests: unknown[], requestClass: new (...args: never[]) => unknown): number {
+		return requests.filter((request) => request instanceof requestClass).length;
+	}
+
+	it("resolves a supergroup after reloading dialogs", async () => {
+		vi.useFakeTimers();
+		vi.spyOn(console, "log").mockImplementation(() => {});
+		const { client, requests } = createClientWithUnknownGroups([GROUP_ID]);
+		const handler = await startHandler(client);
+
+		await triggerChannelDifference(client, GROUP_ID, 10);
+
+		expect(sent(requests, Api.channels.GetChannels)).toBe(1);
+		expect(sent(requests, Api.messages.GetDialogs)).toBe(2);
+		expect(sent(requests, Api.updates.GetChannelDifference)).toBe(1);
+		handler.stop();
+	});
+
+	it("reloads dialogs once per group per interval", async () => {
+		vi.useFakeTimers();
+		vi.spyOn(console, "log").mockImplementation(() => {});
+		vi.spyOn(console, "warn").mockImplementation(() => {});
+		const { client, requests } = createClientWithUnknownGroups([]);
+		const handler = await startHandler(client);
+
+		await triggerChannelDifference(client, GROUP_ID, 10);
+		await triggerChannelDifference(client, GROUP_ID, 30);
+		expect(sent(requests, Api.messages.GetDialogs)).toBe(2);
+
+		await vi.advanceTimersByTimeAsync(11 * 60_000);
+		await triggerChannelDifference(client, GROUP_ID, 50);
+		expect(sent(requests, Api.messages.GetDialogs)).toBe(3);
+		handler.stop();
+	});
+
+	it("runs one dialog reload at a time for the account", async () => {
+		vi.useFakeTimers();
+		vi.spyOn(console, "log").mockImplementation(() => {});
+		vi.spyOn(console, "warn").mockImplementation(() => {});
+		let finishReload: () => void = () => {};
+		const { client, requests } = createOfflineClient((request) => {
+			if (request instanceof Api.messages.GetDialogs) {
+				return sent(requests, Api.messages.GetDialogs) > 1
+					? new Promise((resolve) => {
+							finishReload = () => resolve(emptyDialogs);
+						})
+					: emptyDialogs;
+			}
+			if (request instanceof Api.channels.GetChannels) {
+				return Promise.reject(
+					Object.assign(new Error("CHANNEL_INVALID"), {
+						errorMessage: "CHANNEL_INVALID",
+					}),
+				);
+			}
+			return emptyDialogs;
+		});
+		client.setLogLevel(LogLevel.NONE);
+		const handler = await startHandler(client);
+
+		await triggerChannelDifference(client, GROUP_ID, 10);
+		await triggerChannelDifference(client, OTHER_GROUP_ID, 10);
+		finishReload();
+		await vi.advanceTimersByTimeAsync(1000);
+
+		expect(sent(requests, Api.messages.GetDialogs)).toBe(2);
+		handler.stop();
+	});
+
+	it("resolves two unknown groups with one dialog reload", async () => {
+		vi.useFakeTimers();
+		vi.spyOn(console, "log").mockImplementation(() => {});
+		vi.spyOn(console, "warn").mockImplementation(() => {});
+		let finishReload: () => void = () => {};
+		const { client, requests } = createOfflineClient((request) => {
+			if (request instanceof Api.messages.GetDialogs) {
+				return sent(requests, Api.messages.GetDialogs) > 1
+					? new Promise((resolve) => {
+							finishReload = () =>
+								resolve(
+									new Api.messages.Dialogs({
+										dialogs: [],
+										messages: [],
+										chats: [supergroup(GROUP_ID), supergroup(OTHER_GROUP_ID)],
+										users: [],
+									}),
+								);
+						})
+					: emptyDialogs;
+			}
+			if (request instanceof Api.channels.GetChannels) {
+				return Promise.reject(
+					Object.assign(new Error("CHANNEL_INVALID"), {
+						errorMessage: "CHANNEL_INVALID",
+					}),
+				);
+			}
+			if (request instanceof Api.updates.GetChannelDifference) {
+				return new Api.updates.ChannelDifferenceEmpty({ final: true, pts: 20 });
+			}
+			return emptyDialogs;
+		});
+		client.setLogLevel(LogLevel.NONE);
+		const handler = await startHandler(client);
+
+		await triggerChannelDifference(client, GROUP_ID, 10);
+		await triggerChannelDifference(client, OTHER_GROUP_ID, 10);
+		finishReload();
+		await vi.advanceTimersByTimeAsync(1000);
+
+		expect(sent(requests, Api.messages.GetDialogs)).toBe(2);
+		expect(sent(requests, Api.updates.GetChannelDifference)).toBe(2);
+		handler.stop();
+	});
+
+	it("logs once when the group stays unresolved", async () => {
+		vi.useFakeTimers();
+		vi.spyOn(console, "log").mockImplementation(() => {});
+		const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+		const { client } = createClientWithUnknownGroups([]);
+		const handler = await startHandler(client);
+
+		await triggerChannelDifference(client, GROUP_ID, 10);
+		await triggerChannelDifference(client, GROUP_ID, 30);
+
+		expect(warnSpy).toHaveBeenCalledTimes(1);
+		expect(warnSpy).toHaveBeenCalledWith(
+			`[EventHandler] Supergroup ${GROUP_ID} not resolvable for user 7920216818 — updates of this group are skipped`,
+		);
+		handler.stop();
+	});
+
+	it("logs the unresolved line once per group within ten minutes, including groups that joined a running reload", async () => {
+		vi.useFakeTimers();
+		vi.spyOn(console, "log").mockImplementation(() => {});
+		const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+		const thirdGroupId = 555555555;
+		let finishReload: () => void = () => {};
+		const { client, requests } = createOfflineClient((request) => {
+			if (request instanceof Api.messages.GetDialogs) {
+				return sent(requests, Api.messages.GetDialogs) === 2
+					? new Promise((resolve) => {
+							finishReload = () => resolve(emptyDialogs);
+						})
+					: emptyDialogs;
+			}
+			if (request instanceof Api.channels.GetChannels) {
+				return Promise.reject(
+					Object.assign(new Error("CHANNEL_INVALID"), {
+						errorMessage: "CHANNEL_INVALID",
+					}),
+				);
+			}
+			return emptyDialogs;
+		});
+		client.setLogLevel(LogLevel.NONE);
+		const handler = await startHandler(client);
+		const groupIds = [GROUP_ID, OTHER_GROUP_ID, thirdGroupId];
+
+		for (const groupId of groupIds) await triggerChannelDifference(client, groupId, 10);
+		finishReload();
+		await vi.advanceTimersByTimeAsync(1000);
+		for (const groupId of groupIds) await triggerChannelDifference(client, groupId, 30);
+
+		for (const groupId of groupIds) {
+			const groupLines = warnSpy.mock.calls.filter(([line]) =>
+				String(line).includes(`Supergroup ${groupId} not resolvable`),
+			);
+			expect(groupLines).toHaveLength(1);
+		}
+		handler.stop();
+	});
+
+	it("does not reload dialogs or log when a route request cannot find a supergroup", async () => {
+		vi.useFakeTimers();
+		vi.spyOn(console, "log").mockImplementation(() => {});
+		const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+		const { client, requests } = createClientWithUnknownGroups([]);
+		const handler = await startHandler(client);
+
+		await expect(
+			client.getEntity(new Api.PeerChannel({ channelId: bigInt(GROUP_ID) })),
+		).rejects.toThrow();
+
+		expect(sent(requests, Api.messages.GetDialogs)).toBe(1);
+		expect(warnSpy).not.toHaveBeenCalled();
+		handler.stop();
+	});
+
+	it("logs one line when the dialog reload fails", async () => {
+		vi.useFakeTimers();
+		vi.spyOn(console, "log").mockImplementation(() => {});
+		const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+		const { client, requests } = createOfflineClient((request) => {
+			if (request instanceof Api.messages.GetDialogs) {
+				return sent(requests, Api.messages.GetDialogs) > 1
+					? Promise.reject(new Error("reload exploded"))
+					: emptyDialogs;
+			}
+			if (request instanceof Api.channels.GetChannels) {
+				return Promise.reject(
+					Object.assign(new Error("CHANNEL_INVALID"), {
+						errorMessage: "CHANNEL_INVALID",
+					}),
+				);
+			}
+			return emptyDialogs;
+		});
+		client.setLogLevel(LogLevel.NONE);
+		const handler = await startHandler(client);
+
+		await triggerChannelDifference(client, GROUP_ID, 10);
+		await triggerChannelDifference(client, GROUP_ID, 30);
+
+		expect(sent(requests, Api.messages.GetDialogs)).toBe(2);
+		expect(warnSpy).toHaveBeenCalledTimes(1);
+		expect(warnSpy).toHaveBeenCalledWith(
+			"[EventHandler] Dialog reload failed for user 7920216818: reload exploded",
+		);
+		handler.stop();
+	});
+
+	it("allows another dialog reload after a reload that never answers times out", async () => {
+		vi.useFakeTimers();
+		vi.spyOn(console, "log").mockImplementation(() => {});
+		vi.spyOn(console, "warn").mockImplementation(() => {});
+		const { client, requests } = createOfflineClient((request) => {
+			if (request instanceof Api.messages.GetDialogs) {
+				return sent(requests, Api.messages.GetDialogs) === 2
+					? new Promise(() => {})
+					: emptyDialogs;
+			}
+			if (request instanceof Api.channels.GetChannels) {
+				return Promise.reject(
+					Object.assign(new Error("CHANNEL_INVALID"), {
+						errorMessage: "CHANNEL_INVALID",
+					}),
+				);
+			}
+			return emptyDialogs;
+		});
+		client.setLogLevel(LogLevel.NONE);
+		const handler = await startHandler(client);
+
+		await triggerChannelDifference(client, GROUP_ID, 10);
+		await triggerChannelDifference(client, OTHER_GROUP_ID, 10);
+		expect(sent(requests, Api.messages.GetDialogs)).toBe(2);
+
+		await vi.advanceTimersByTimeAsync(125_000);
+		await triggerChannelDifference(client, OTHER_GROUP_ID, 30);
+
+		expect(sent(requests, Api.messages.GetDialogs)).toBe(3);
+		handler.stop();
+	});
+
+	it("delivers a later supergroup message after a lost channel difference reply times out", async () => {
+		vi.useFakeTimers();
+		vi.spyOn(console, "log").mockImplementation(() => {});
+		vi.spyOn(console, "warn").mockImplementation(() => {});
+		const persisted = spyOnPersist();
+		const { client, requests } = createClientWithUnknownGroups(
+			[GROUP_ID],
+			(requestNumber) =>
+				requestNumber === 1
+					? new Promise(() => {})
+					: new Api.updates.ChannelDifference({
+							final: true,
+							pts: 30,
+							newMessages: [
+								new Api.Message({
+									id: 55,
+									peerId: new Api.PeerChannel({ channelId: bigInt(GROUP_ID) }),
+									message: "hello",
+									date: 1,
+								}),
+							],
+							otherUpdates: [],
+							chats: [supergroup(GROUP_ID)],
+							users: [],
+						}),
+		);
+		const handler = await startHandler(client);
+
+		await triggerChannelDifference(client, GROUP_ID, 10);
+		expect(sent(requests, Api.updates.GetChannelDifference)).toBe(1);
+		expect(persisted).toHaveLength(0);
+
+		await vi.advanceTimersByTimeAsync(125_000 + 120_000);
+		await triggerChannelDifference(client, GROUP_ID, 50);
+
+		expect(sent(requests, Api.updates.GetChannelDifference)).toBeGreaterThan(1);
+		expect(persisted).toHaveLength(1);
+		handler.stop();
+	});
+
+	it("restores the supergroup lookup on stop and never replaces the client lookup", async () => {
+		vi.useFakeTimers();
+		vi.spyOn(console, "log").mockImplementation(() => {});
+		const { client } = createOfflineClient(() => emptyDialogs);
+		const updateManager = client.updateManager as unknown as { resolveChannel: unknown };
+		const originalGetInputEntity = client.getInputEntity;
+		const originalResolveChannel = updateManager.resolveChannel;
+		const handler = await startHandler(client);
+		expect(updateManager.resolveChannel).not.toBe(originalResolveChannel);
+		expect(client.getInputEntity).toBe(originalGetInputEntity);
+
+		handler.stop();
+
+		expect(updateManager.resolveChannel).toBe(originalResolveChannel);
+		expect(client.getInputEntity).toBe(originalGetInputEntity);
 	});
 });
