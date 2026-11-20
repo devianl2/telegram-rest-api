@@ -71,6 +71,7 @@ const CREDENTIAL_RETRY_DELAY_MS = 5_000;
 type ProbeOutcome = "authorized" | "credential_error" | "transient_error";
 
 interface SessionInfo {
+	id: bigint;
 	callback_url: string;
 	telegram_user_id: string;
 }
@@ -85,7 +86,9 @@ export class TelegramSessionWatchdog {
 
 	private readonly serverPositions = new Map<string, number>();
 
-	private readonly confirmedCredentialErrors = new Set<string>();
+	private readonly probeErrors = new Map<string, unknown>();
+
+	private readonly confirmedCredentialErrors = new Map<string, unknown>();
 
 	private readonly stallTrackers = new Map<
 		string,
@@ -165,6 +168,7 @@ export class TelegramSessionWatchdog {
 		this.busy = true;
 		this.tickStartedAt = Date.now();
 		this.serverPositions.clear();
+		this.probeErrors.clear();
 		try {
 			await this.evictLoggedOutSessions();
 			await this.disconnectStalledSessions();
@@ -203,6 +207,7 @@ export class TelegramSessionWatchdog {
 			this.serverPositions.set(sessionId, state.pts);
 			return "authorized";
 		} catch (error) {
+			this.probeErrors.set(sessionId, error);
 			return TelegramUtils.isCredentialError(error)
 				? "credential_error"
 				: "transient_error";
@@ -288,12 +293,7 @@ export class TelegramSessionWatchdog {
 				: await this.reprobeWithRetries(sessionId, client);
 			if (confirmed === "credential_error") {
 				const revoked = await this.revokeUnauthorizedSession(sessionId);
-				this.recordCredentialRevokeOutcome(sessionId, revoked);
-				if (revoked) {
-					console.log(
-						`[Watchdog] Session credential check failed after ${CREDENTIAL_MAX_RETRIES} retries — revoked`,
-					);
-				}
+				this.recordCredentialRevokeOutcome(sessionId, revoked, this.probeErrors.get(sessionId));
 			} else if (confirmed === "authorized") {
 				this.failureRuns.delete(sessionId);
 				this.lastEmittedReason.delete(sessionId);
@@ -503,13 +503,14 @@ export class TelegramSessionWatchdog {
 	private recordCredentialRevokeOutcome(
 		sessionId: string,
 		revoked: boolean,
+		telegramError: unknown,
 	): void {
 		if (revoked) {
 			this.failureRuns.delete(sessionId);
 			this.lastEmittedReason.delete(sessionId);
 			this.confirmedCredentialErrors.delete(sessionId);
 		} else {
-			this.confirmedCredentialErrors.add(sessionId);
+			this.confirmedCredentialErrors.set(sessionId, telegramError);
 		}
 	}
 
@@ -519,13 +520,19 @@ export class TelegramSessionWatchdog {
 			await TelegramClientService.invalidate(sessionId, "authorization_check_failed");
 			return true;
 		}
-		return this.disconnectThenRevoke(sessionId, info, "authorization_check_failed");
+		return this.disconnectThenRevoke(
+			sessionId,
+			info,
+			"authorization_check_failed",
+			this.probeErrors.get(sessionId),
+		);
 	}
 
 	private async disconnectThenRevoke(
 		sessionId: string,
 		info: SessionInfo,
 		reason: SessionLifecycleReason,
+		telegramError?: unknown,
 	): Promise<boolean> {
 		const accepted = await SessionCallbackService.notify(
 			info.callback_url,
@@ -546,7 +553,12 @@ export class TelegramSessionWatchdog {
 			return false;
 		}
 
-		await TelegramClientService.invalidate(sessionId, reason);
+		const removed = await TelegramClientService.invalidate(sessionId, reason);
+		if (removed) {
+			console.log(
+				`[Watchdog] Session id=${info.id} user=${info.telegram_user_id} removed reason=${reason} error=${telegramError instanceof Error ? telegramError.message : "none"}`,
+			);
+		}
 		return true;
 	}
 
@@ -608,12 +620,14 @@ export class TelegramSessionWatchdog {
 			if (TelegramClientService.isPooled(session.session_id)) continue;
 
 			if (this.confirmedCredentialErrors.has(session.session_id)) {
+				const confirmedError = this.confirmedCredentialErrors.get(session.session_id);
 				const revoked = await this.disconnectThenRevoke(
 					session.session_id,
 					session,
 					"authorization_check_failed",
+					confirmedError,
 				);
-				this.recordCredentialRevokeOutcome(session.session_id, revoked);
+				this.recordCredentialRevokeOutcome(session.session_id, revoked, confirmedError);
 				continue;
 			}
 
@@ -665,13 +679,9 @@ export class TelegramSessionWatchdog {
 						session.session_id,
 						session,
 						"authorization_check_failed",
+						error,
 					);
-					this.recordCredentialRevokeOutcome(session.session_id, revoked);
-					if (revoked) {
-						console.log(
-							`[Watchdog] Session id=${session.id} has dead credentials after ${CREDENTIAL_MAX_RETRIES} retries — revoked`,
-						);
-					}
+					this.recordCredentialRevokeOutcome(session.session_id, revoked, error);
 					continue;
 				}
 
@@ -732,6 +742,7 @@ export class TelegramSessionWatchdog {
 		const rows = await DatabaseClient.getInstance().execute((db) =>
 			db
 				.select({
+					id: telegramSessions.id,
 					callback_url: telegramSessions.callback_url,
 					telegram_user_id: telegramSessions.telegram_user_id,
 				})

@@ -424,6 +424,20 @@ describe("TelegramSessionWatchdog stalled sessions", () => {
 		);
 	});
 
+	it("logs the removal of a stalled session without a Telegram error", async () => {
+		const logSpy = vi.spyOn(console, "log");
+		addSession("stalled", 500, 100);
+
+		await tickAfter(watchdog, 0);
+		await tickAfter(watchdog, 5);
+
+		const removalLines = logLinesContaining(logSpy, "removed reason=");
+		expect(removalLines).toHaveLength(1);
+		expect(removalLines[0][0]).toBe(
+			"[Watchdog] Session id=1 user=user-stalled removed reason=receiving_updates_stalled error=none",
+		);
+	});
+
 	it("keeps the session when the callback is not accepted", async () => {
 		addSession("stalled", 500, 100);
 		notify.mockResolvedValue(false);
@@ -610,6 +624,32 @@ describe("TelegramSessionWatchdog existing behaviour", () => {
 		);
 	});
 
+	it("logs one removal line with the row id, the Telegram user, the reason and the Telegram error, never the session string", async () => {
+		const logSpy = vi.spyOn(console, "log");
+		const sessionString = "auth-key-session-string";
+		failWithDeadCredentials(addSession(sessionString, 100, 100));
+		sessionRows[0].telegram_user_id = "777";
+
+		await runTickThroughCredentialRetries();
+
+		const removalLines = logLinesContaining(logSpy, "removed reason=");
+		expect(removalLines).toHaveLength(1);
+		expect(removalLines[0][0]).toBe(
+			"[Watchdog] Session id=1 user=777 removed reason=authorization_check_failed error=AUTH_KEY_UNREGISTERED",
+		);
+		expect(logLinesContaining(logSpy, sessionString)).toHaveLength(0);
+	});
+
+	it("logs no removal line when the session row was already gone", async () => {
+		const logSpy = vi.spyOn(console, "log");
+		failWithDeadCredentials(addSession("dead", 100, 100));
+		invalidate.mockResolvedValue(false);
+
+		await runTickThroughCredentialRetries();
+
+		expect(logLinesContaining(logSpy, "removed reason=")).toHaveLength(0);
+	});
+
 	describe("a session missing from the pool", () => {
 		beforeEach(() => {
 			vi.mocked(TelegramClientService.getPooledSessionIds).mockReturnValue([]);
@@ -652,7 +692,8 @@ describe("TelegramSessionWatchdog existing behaviour", () => {
 			).toHaveLength(1);
 		});
 
-		it("does not connect again while the disconnect callback is not accepted", async () => {
+		it("does not connect again while the disconnect callback is not accepted and logs the first Telegram error when it is removed", async () => {
+			const logSpy = vi.spyOn(console, "log");
 			notify.mockResolvedValue(false);
 
 			await runTickThroughCredentialRetries();
@@ -672,6 +713,11 @@ describe("TelegramSessionWatchdog existing behaviour", () => {
 
 			expect(TelegramClientService.initialize).not.toHaveBeenCalled();
 			expect(invalidate).toHaveBeenCalledTimes(1);
+			const removalLines = logLinesContaining(logSpy, "removed reason=");
+			expect(removalLines).toHaveLength(1);
+			expect(removalLines[0][0]).toBe(
+				"[Watchdog] Session id=1 user=user-missing removed reason=authorization_check_failed error=AUTH_KEY_UNREGISTERED",
+			);
 		});
 	});
 
@@ -959,6 +1005,19 @@ describe("TelegramSessionWatchdog failed authorization checks", () => {
 		expect(notify).not.toHaveBeenCalled();
 		expect(invalidate).toHaveBeenCalledWith("orphan", "authorization_check_failed");
 		expect(logLinesContaining(logSpy, "consecutive times — revoked")).toHaveLength(1);
+	});
+
+	it("logs the Telegram error of the probe that led to the removal", async () => {
+		const logSpy = vi.spyOn(console, "log");
+		addFlakySession("flaky");
+
+		await failChecksEvery(10, 19);
+
+		const removalLines = logLinesContaining(logSpy, "removed reason=");
+		expect(removalLines).toHaveLength(1);
+		expect(removalLines[0][0]).toBe(
+			"[Watchdog] Session id=1 user=user-flaky removed reason=authorization_check_failed error=authorization probe timed out",
+		);
 	});
 
 	it("keeps the session at the threshold when the callback is not accepted", async () => {
