@@ -503,18 +503,176 @@ describe("TelegramSessionWatchdog existing behaviour", () => {
 		vi.restoreAllMocks();
 	});
 
-	it("revokes a session with dead credentials without a disconnect callback", async () => {
-		const session = addSession("dead", 100, 100);
-		session.probeError = Object.assign(new Error("AUTH_KEY_UNREGISTERED"), {
-			code: 401,
-		});
-
+	async function runTickThroughCredentialRetries(): Promise<void> {
 		const tick = runTick(watchdog);
 		await vi.advanceTimersByTimeAsync(20_000);
 		await tick;
+	}
 
-		expect(invalidate).toHaveBeenCalledWith("dead", "unauthorized");
-		expect(notify).not.toHaveBeenCalled();
+	function failWithDeadCredentials(session: FakeSession): void {
+		session.probeError = Object.assign(new Error("AUTH_KEY_UNREGISTERED"), {
+			code: 401,
+		});
+	}
+
+	function authorizationCheckFailedCallbacks() {
+		return notify.mock.calls.filter(([, , , , , reason]) => reason === "authorization_check_failed");
+	}
+
+	function spyOnProbes() {
+		return vi.spyOn(
+			watchdog as unknown as { probeSession: () => Promise<unknown> },
+			"probeSession",
+		);
+	}
+
+	it("does not repeat the credential confirmation while the disconnect callback is not accepted", async () => {
+		failWithDeadCredentials(addSession("dead", 100, 100));
+		notify.mockResolvedValue(false);
+		const probeSession = spyOnProbes();
+
+		await runTickThroughCredentialRetries();
+		expect(probeSession).toHaveBeenCalledTimes(3);
+		probeSession.mockClear();
+		await runTick(watchdog);
+
+		expect(probeSession).toHaveBeenCalledTimes(1);
+		expect(authorizationCheckFailedCallbacks()).toHaveLength(2);
+		expect(invalidate).not.toHaveBeenCalled();
+
+		notify.mockResolvedValue(true);
+		await runTick(watchdog);
+
+		expect(invalidate).toHaveBeenCalledTimes(1);
+		expect(invalidate).toHaveBeenCalledWith("dead", "authorization_check_failed");
+	});
+
+	it("confirms the credentials again with retries when a session recovered in between", async () => {
+		const session = addSession("dead", 100, 100);
+		failWithDeadCredentials(session);
+		notify.mockResolvedValue(false);
+		const probeSession = spyOnProbes();
+
+		await runTickThroughCredentialRetries();
+		session.probeError = undefined;
+		await runTick(watchdog);
+
+		expect(authorizationCheckFailedCallbacks()).toHaveLength(1);
+		expect(invalidate).not.toHaveBeenCalled();
+
+		failWithDeadCredentials(session);
+		probeSession.mockClear();
+		await runTickThroughCredentialRetries();
+
+		expect(probeSession).toHaveBeenCalledTimes(3);
+		expect(authorizationCheckFailedCallbacks()).toHaveLength(2);
+		expect(invalidate).not.toHaveBeenCalled();
+	});
+
+	it("confirms the credentials again with retries when a probe failed for another reason in between", async () => {
+		const session = addSession("dead", 100, 100);
+		failWithDeadCredentials(session);
+		notify.mockResolvedValue(false);
+		const probeSession = spyOnProbes();
+
+		await runTickThroughCredentialRetries();
+		session.probeError = new Error("authorization probe timed out");
+		await runTick(watchdog);
+
+		expect(authorizationCheckFailedCallbacks()).toHaveLength(1);
+		expect(invalidate).not.toHaveBeenCalled();
+
+		failWithDeadCredentials(session);
+		probeSession.mockClear();
+		await runTickThroughCredentialRetries();
+
+		expect(probeSession).toHaveBeenCalledTimes(3);
+		expect(authorizationCheckFailedCallbacks()).toHaveLength(2);
+		expect(invalidate).not.toHaveBeenCalled();
+	});
+
+	it("tells Chat-X a session with dead credentials is disconnected before revoking it", async () => {
+		failWithDeadCredentials(addSession("dead", 100, 100));
+
+		await runTickThroughCredentialRetries();
+
+		expect(notify).toHaveBeenCalledWith(
+			"https://example.com/dead",
+			"telegram_session_disconnected",
+			"dead",
+			"user-dead",
+			"disconnected",
+			"authorization_check_failed",
+		);
+		expect(invalidate).toHaveBeenCalledWith("dead", "authorization_check_failed");
+		expect(notify.mock.invocationCallOrder[0]).toBeLessThan(
+			invalidate.mock.invocationCallOrder[0],
+		);
+	});
+
+	describe("a session missing from the pool", () => {
+		beforeEach(() => {
+			vi.mocked(TelegramClientService.getPooledSessionIds).mockReturnValue([]);
+			vi.mocked(TelegramClientService.isPooled).mockReturnValue(false);
+			vi.mocked(TelegramClientService.initialize).mockRejectedValue(
+				Object.assign(new Error("AUTH_KEY_UNREGISTERED"), { code: 401 }),
+			);
+			addSession("missing", 100, 100);
+		});
+
+		it("tells Chat-X it is disconnected before revoking it when its credentials are dead", async () => {
+			await runTickThroughCredentialRetries();
+
+			expect(notify).toHaveBeenCalledWith(
+				"https://example.com/missing",
+				"telegram_session_disconnected",
+				"missing",
+				"user-missing",
+				"disconnected",
+				"authorization_check_failed",
+			);
+			expect(invalidate).toHaveBeenCalledWith("missing", "authorization_check_failed");
+			const disconnectedCallIndex = notify.mock.calls.findIndex(
+				([, , , , , reason]) => reason === "authorization_check_failed",
+			);
+			expect(notify.mock.invocationCallOrder[disconnectedCallIndex]).toBeLessThan(
+				invalidate.mock.invocationCallOrder[0],
+			);
+		});
+
+		it("keeps it and sends the reconnecting callback once while the disconnect callback is not accepted", async () => {
+			notify.mockResolvedValue(false);
+
+			await runTickThroughCredentialRetries();
+			await runTickThroughCredentialRetries();
+
+			expect(invalidate).not.toHaveBeenCalled();
+			expect(
+				notify.mock.calls.filter(([, , , , , reason]) => reason === "reconnecting"),
+			).toHaveLength(1);
+		});
+
+		it("does not connect again while the disconnect callback is not accepted", async () => {
+			notify.mockResolvedValue(false);
+
+			await runTickThroughCredentialRetries();
+			expect(TelegramClientService.initialize).toHaveBeenCalledTimes(3);
+			vi.mocked(TelegramClientService.initialize).mockClear();
+			vi.mocked(TelegramClientService.initialize).mockRejectedValue(
+				Object.assign(new Error("SECOND_TICK_ERROR"), { code: 401 }),
+			);
+			await runTick(watchdog);
+
+			expect(TelegramClientService.initialize).not.toHaveBeenCalled();
+			expect(authorizationCheckFailedCallbacks()).toHaveLength(2);
+			expect(invalidate).not.toHaveBeenCalled();
+
+			notify.mockResolvedValue(true);
+			await runTick(watchdog);
+
+			expect(TelegramClientService.initialize).not.toHaveBeenCalled();
+			expect(invalidate).toHaveBeenCalledTimes(1);
+		});
 	});
 
 	it("skips eviction when most sessions fail the probe", async () => {

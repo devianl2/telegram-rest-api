@@ -14,7 +14,7 @@ interface TelegramSessionRecord {
 	id: bigint;
 	session_id: string;
 	telegram_user_id: string;
-	callback_url?: string;
+	callback_url: string;
 }
 
 /**
@@ -35,7 +35,9 @@ interface TelegramSessionRecord {
  * 3. **Dead session** — a session is active in the database but absent from
  *    the pool (e.g. the process crashed and restarted without a full restore,
  *    or the connection dropped silently). The session is re-initialized and
- *    added back to the pool automatically.
+ *    added back to the pool automatically, unless its credential error is
+ *    already confirmed: then only its disconnect callback is sent again
+ *    until Chat-X accepts it.
  *
  * The check interval is controlled by `WATCHDOG_INTERVAL_SECONDS` in the
  * environment file (default: 60 seconds).
@@ -58,9 +60,9 @@ const PROBE_TIMEOUT_MS = 15_000;
  * key) are definitive verdicts from Telegram, so they get a short bounded
  * confirmation — at most {@link CREDENTIAL_MAX_RETRIES} retries spaced
  * {@link CREDENTIAL_RETRY_DELAY_MS} apart — after which the session is
- * invalidated and the disconnect callback fired. Without the bound, a
- * credential-dead session stays ACTIVE in the database and is retried on
- * every tick forever.
+ * reported to Chat-X as disconnected and, once that callback is accepted,
+ * invalidated. Until it is accepted the session stays and only the callback
+ * is sent again on the next tick; the confirmation is not repeated.
  */
 const CREDENTIAL_MAX_RETRIES = 2;
 const CREDENTIAL_RETRY_DELAY_MS = 5_000;
@@ -82,6 +84,8 @@ export class TelegramSessionWatchdog {
 	private tickStartedAt = 0;
 
 	private readonly serverPositions = new Map<string, number>();
+
+	private readonly confirmedCredentialErrors = new Set<string>();
 
 	private readonly stallTrackers = new Map<
 		string,
@@ -266,23 +270,30 @@ export class TelegramSessionWatchdog {
 		// Credential errors are a definitive verdict from Telegram (the network
 		// round-trip itself succeeded), so they are exempt from the
 		// network-outage circuit breaker and the slow failure-run
-		// tracking below. Confirm with a short bounded retry, then revoke —
-		// otherwise a mass logout would trip the breaker and loop forever.
+		// tracking below. Confirm with a short bounded retry, then revoke once
+		// Chat-X accepts the disconnect callback. Without the confirmation a
+		// mass logout would trip the breaker and loop forever.
 		for (const [sessionId, outcome] of [...results]) {
-			if (outcome !== "credential_error") continue;
+			if (outcome !== "credential_error") {
+				this.confirmedCredentialErrors.delete(sessionId);
+				continue;
+			}
 			results.delete(sessionId);
 
 			const client = TelegramClientService.getFromPool(sessionId);
 			if (!client) continue;
 
-			const confirmed = await this.reprobeWithRetries(sessionId, client);
+			const confirmed = this.confirmedCredentialErrors.has(sessionId)
+				? "credential_error"
+				: await this.reprobeWithRetries(sessionId, client);
 			if (confirmed === "credential_error") {
-				this.failureRuns.delete(sessionId);
-				this.lastEmittedReason.delete(sessionId);
-				await TelegramClientService.invalidate(sessionId, "unauthorized");
-				console.log(
-					`[Watchdog] Session credential check failed after ${CREDENTIAL_MAX_RETRIES} retries — revoked`,
-				);
+				const revoked = await this.revokeUnauthorizedSession(sessionId);
+				this.recordCredentialRevokeOutcome(sessionId, revoked);
+				if (revoked) {
+					console.log(
+						`[Watchdog] Session credential check failed after ${CREDENTIAL_MAX_RETRIES} retries — revoked`,
+					);
+				}
 			} else if (confirmed === "authorized") {
 				this.failureRuns.delete(sessionId);
 				this.lastEmittedReason.delete(sessionId);
@@ -341,20 +352,7 @@ export class TelegramSessionWatchdog {
 				failureRun.failingMilliseconds >= REVOKE_AFTER_FAILING_MS &&
 				failureRun.failedChecks >= REVOKE_AFTER_FAILED_CHECKS
 			) {
-				const info = await this.resolveSessionInfo(sessionId);
-				let revoked = true;
-				if (info) {
-					revoked = await this.disconnectThenRevoke(
-						sessionId,
-						info,
-						"authorization_check_failed",
-					);
-				} else {
-					await TelegramClientService.invalidate(
-						sessionId,
-						"authorization_check_failed",
-					);
-				}
+				const revoked = await this.revokeUnauthorizedSession(sessionId);
 				if (revoked) {
 					this.failureRuns.delete(sessionId);
 					this.lastEmittedReason.delete(sessionId);
@@ -502,6 +500,28 @@ export class TelegramSessionWatchdog {
 		}
 	}
 
+	private recordCredentialRevokeOutcome(
+		sessionId: string,
+		revoked: boolean,
+	): void {
+		if (revoked) {
+			this.failureRuns.delete(sessionId);
+			this.lastEmittedReason.delete(sessionId);
+			this.confirmedCredentialErrors.delete(sessionId);
+		} else {
+			this.confirmedCredentialErrors.add(sessionId);
+		}
+	}
+
+	private async revokeUnauthorizedSession(sessionId: string): Promise<boolean> {
+		const info = await this.resolveSessionInfo(sessionId);
+		if (!info) {
+			await TelegramClientService.invalidate(sessionId, "authorization_check_failed");
+			return true;
+		}
+		return this.disconnectThenRevoke(sessionId, info, "authorization_check_failed");
+	}
+
 	private async disconnectThenRevoke(
 		sessionId: string,
 		info: SessionInfo,
@@ -551,7 +571,9 @@ export class TelegramSessionWatchdog {
 	 * Scenario 3: Database has an active session that is not in the pool.
 	 *
 	 * Queries the database for all active sessions belonging to this server
-	 * and re-initializes any that are missing from the pool.
+	 * and re-initializes any that are missing from the pool, except a session
+	 * with an already confirmed credential error, which only gets its
+	 * disconnect callback sent again until Chat-X accepts it.
 	 */
 	private async reviveDeadSessions(): Promise<void> {
 		const serverName = process.env.SERVER_NAME ?? "";
@@ -584,6 +606,16 @@ export class TelegramSessionWatchdog {
 
 		for (const session of activeSessions) {
 			if (TelegramClientService.isPooled(session.session_id)) continue;
+
+			if (this.confirmedCredentialErrors.has(session.session_id)) {
+				const revoked = await this.disconnectThenRevoke(
+					session.session_id,
+					session,
+					"authorization_check_failed",
+				);
+				this.recordCredentialRevokeOutcome(session.session_id, revoked);
+				continue;
+			}
 
 			console.log(
 				`[Watchdog] Session id=${session.id} is active in DB but not pooled — Reconnecting`,
@@ -624,19 +656,22 @@ export class TelegramSessionWatchdog {
 				);
 
 				// Credential errors survived the bounded retries above — the
-				// session is dead for good. Invalidate it (removes the ACTIVE
-				// database row, so the revive loop stops picking it up) and
-				// fire the existing disconnect callback via invalidate().
+				// session is dead for good. Tell Chat-X it is disconnected, and
+				// only once that callback is accepted remove the session (the
+				// ACTIVE database row, so the revive loop stops picking it up).
+				// Otherwise keep it and try again next tick.
 				if (TelegramUtils.isCredentialError(error)) {
-					this.failureRuns.delete(session.session_id);
-					this.lastEmittedReason.delete(session.session_id);
-					await TelegramClientService.invalidate(
+					const revoked = await this.disconnectThenRevoke(
 						session.session_id,
-						"unauthorized",
+						session,
+						"authorization_check_failed",
 					);
-					console.log(
-						`[Watchdog] Session id=${session.id} has dead credentials after ${CREDENTIAL_MAX_RETRIES} retries — revoked`,
-					);
+					this.recordCredentialRevokeOutcome(session.session_id, revoked);
+					if (revoked) {
+						console.log(
+							`[Watchdog] Session id=${session.id} has dead credentials after ${CREDENTIAL_MAX_RETRIES} retries — revoked`,
+						);
+					}
 					continue;
 				}
 
