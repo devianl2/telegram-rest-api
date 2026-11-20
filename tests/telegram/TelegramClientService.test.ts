@@ -33,6 +33,10 @@ vi.mock("../../src/services/SessionCallbackService", () => ({
 	SessionCallbackService: { notify: vi.fn().mockResolvedValue(true) },
 }));
 
+import { PgDialect } from "drizzle-orm/pg-core";
+import type { SQL } from "drizzle-orm";
+import { DatabaseClient } from "../../src/database/DatabaseClient";
+import { SessionCallbackService } from "../../src/services/SessionCallbackService";
 import { TelegramClientService } from "../../src/telegram/TelegramClientService";
 
 describe("TelegramClientService event handler", () => {
@@ -143,6 +147,19 @@ describe("TelegramClientService.invalidate", () => {
 		errorSpy.mockRestore();
 	});
 
+	it("tells Chat-X the session was removed with the reason it was given", async () => {
+		await TelegramClientService.invalidate("session-1", "logout");
+
+		expect(SessionCallbackService.notify).toHaveBeenCalledWith(
+			"https://example.com/callback",
+			"telegram_session_removed",
+			"session-1",
+			"42",
+			"removed",
+			"logout",
+		);
+	});
+
 	it("logs out and destroys a client that answers", async () => {
 		const destroy = vi.fn().mockResolvedValue(undefined);
 		const invoke = vi.fn().mockResolvedValue(true);
@@ -157,5 +174,44 @@ describe("TelegramClientService.invalidate", () => {
 
 		expect(invoke).toHaveBeenCalledTimes(1);
 		expect(destroy).toHaveBeenCalledTimes(1);
+	});
+});
+
+describe("TelegramClientService.findSessionRecord", () => {
+	const originalServerName = process.env.SERVER_NAME;
+
+	afterEach(() => {
+		vi.restoreAllMocks();
+		if (originalServerName === undefined) delete process.env.SERVER_NAME;
+		else process.env.SERVER_NAME = originalServerName;
+	});
+
+	it("looks the session up only among the rows of this server", async () => {
+		process.env.SERVER_NAME = "server-a";
+		let condition: SQL | undefined;
+		let rowLimit: number | undefined;
+		const queryBuilder = {
+			select: () => queryBuilder,
+			from: () => queryBuilder,
+			where: (whereCondition: SQL) => {
+				condition = whereCondition;
+				return queryBuilder;
+			},
+			limit: (limitCount: number) => {
+				rowLimit = limitCount;
+				return Promise.resolve([]);
+			},
+		};
+		vi.spyOn(DatabaseClient, "getInstance").mockReturnValue({
+			execute: (operation: (database: unknown) => unknown) => operation(queryBuilder),
+		} as unknown as DatabaseClient);
+
+		await TelegramClientService.findSessionRecord("session-1");
+
+		const query = new PgDialect().sqlToQuery(condition!);
+		expect(query.sql).toContain('"session_id" = $1');
+		expect(query.sql).toContain('"server_name" = $2');
+		expect(query.params).toEqual(["session-1", "server-a"]);
+		expect(rowLimit).toBe(1);
 	});
 });
