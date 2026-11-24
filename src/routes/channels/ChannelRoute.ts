@@ -951,11 +951,14 @@ export class ChannelRoute extends BaseRoute {
 		fastify.post(
 			"/channels/GetParticipants",
 			async (request: FastifyRequest, reply: FastifyReply) => {
-				const { sessionId, channelId, accessHash } = request.body as {
+				const { sessionId, channelId, accessHash, offset, limit } = request.body as {
 					sessionId: string;
 					channelId: string;
 					accessHash?: string;
+					offset?: number;
+					limit?: number;
 				};
+				const page = TelegramUtils.participantsPage(offset, limit);
 
 				if (!sessionId || !channelId) {
 					return new ErrorResponse(
@@ -980,8 +983,8 @@ export class ChannelRoute extends BaseRoute {
 								new Api.channels.GetParticipants({
 									channel: this.inputChannel(channelId, resolvedHash),
 									filter: new Api.ChannelParticipantsRecent(),
-									offset: 0,
-									limit: 200,
+									offset: page.offset,
+									limit: page.limit,
 									hash: bigInt.zero,
 								}),
 							);

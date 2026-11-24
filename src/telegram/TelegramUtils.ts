@@ -227,6 +227,15 @@ export class TelegramUtils {
 		return mapped.length > 0 ? mapped : undefined;
 	}
 
+	static participantsPage(offset: unknown, limit: unknown): { offset: number; limit: number } {
+		const o = Math.floor(Number(offset));
+		const l = Math.floor(Number(limit));
+		return {
+			offset: Number.isFinite(o) && o > 0 ? o : 0,
+			limit: Number.isFinite(l) && l > 0 ? Math.min(l, 200) : 200,
+		};
+	}
+
 	static randomId() {
 		return bigInt(Date.now())
 			.multiply(bigInt(1_000))

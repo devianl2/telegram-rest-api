@@ -145,3 +145,19 @@ describe("TelegramUtils.pickPhotoSize", () => {
 		});
 	});
 });
+
+describe("TelegramUtils.participantsPage", () => {
+	it("passes a valid page through", () => {
+		expect(TelegramUtils.participantsPage(200, 200)).toEqual({ offset: 200, limit: 200 });
+	});
+
+	it("defaults to the first 200 when offset and limit are missing", () => {
+		expect(TelegramUtils.participantsPage(undefined, undefined)).toEqual({ offset: 0, limit: 200 });
+	});
+
+	it("caps limit at Telegram's 200 and rejects negative or junk values", () => {
+		expect(TelegramUtils.participantsPage(-5, 1000)).toEqual({ offset: 0, limit: 200 });
+		expect(TelegramUtils.participantsPage("abc", 0)).toEqual({ offset: 0, limit: 200 });
+		expect(TelegramUtils.participantsPage("400", "50.7")).toEqual({ offset: 400, limit: 50 });
+	});
+});
